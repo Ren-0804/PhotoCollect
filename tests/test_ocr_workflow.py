@@ -1346,6 +1346,8 @@ class DashboardWorkflowTests(unittest.TestCase):
             detail = window._detail_page
             expected_detail_order = (
                 detail.btn_back,
+                # Previous/next box buttons are disabled (and skipped by Tab) at the ends of the list.
+                *[button for button in (detail.btn_prev_box, detail.btn_next_box) if button.isEnabled()],
                 detail.btn_next_missing,
                 detail.btn_ocr,
                 detail.btn_more,

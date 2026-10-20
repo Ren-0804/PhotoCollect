@@ -311,7 +311,7 @@ class AutoSortTests(unittest.TestCase):
 
             self.assertIsNone(detail._auto_sort_task)
             self.assertEqual(self.stored(root), {"5": [f"{BOX}-5.jpg"]})
-            self.assertEqual(detail.auto_sort_zone.lbl_hint.text(), con.AutoSortDropZone.IDLE_HINT)
+            self.assertEqual(detail.auto_sort_zone.lbl_hint.fullText(), con.AutoSortDropZone.IDLE_HINT)
             # The slot summary comes after the background save's own toasts.
             self.assertIn("后台已保存 1 张照片", self.notices)
             self.assertIn("已自动放入 5 全关门 1 张", self.notices[-1])

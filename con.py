@@ -2176,6 +2176,8 @@ class DropZoneCard(QFrame):
         self.is_selected = False
         self._visual_state_key = None
         self._last_card_width = None
+        self._last_card_height = None
+        self._photo_area = (200, 150)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumHeight(160)
@@ -2298,34 +2300,40 @@ class DropZoneCard(QFrame):
         """
 
     def set_card_width(self, w, force=False):
+        self.set_card_size(w, None, force=force)
+
+    def set_card_size(self, w, h=None, force=False):
+        """Fix the card width and, when `h` is given, its height too (the
+        detail page uses that to fit all eight cards on screen); otherwise the
+        photo area keeps a 4:3 shape."""
         w = int(w)
-        if not force and self._last_card_width == w:
+        h = int(h) if h else None
+        if not force and self._last_card_width == w and self._last_card_height == h:
             return
         self._last_card_width = w
+        self._last_card_height = h
         self.setFixedWidth(w)
         pad = max(9, min(14, w // 22))
+        spacing = 8
         self._card_layout.setContentsMargins(pad, pad, pad, pad)
-        self._card_layout.setSpacing(8)
+        self._card_layout.setSpacing(spacing)
 
         self.lbl_title.setStyleSheet(f"""
             font-weight: 700; font-size: 13px;
             color: {Theme.TEXT_MAIN if self.is_required else Theme.TEXT_SEC};
         """)
 
+        btn_h = 32
         # 图片列表自适应
         lw_w = max(80, w - pad * 2)
-        lw_h = max(60, int(lw_w * 0.75))
-        self.lw.setIconSize(QSize(lw_w - 4, lw_h - 4))
-        self.lw.setGridSize(QSize(lw_w, lw_h))
+        if h:
+            header_h = max(self.lbl_title.sizeHint().height(), self.req_badge.sizeHint().height())
+            lw_h = max(60, h - pad * 2 - header_h - btn_h - spacing * 2)
+        else:
+            lw_h = max(60, int(lw_w * 0.75))
         self.lw.setFixedSize(lw_w, lw_h)
-        for i in range(self.lw.count()):
-            it = self.lw.item(i)
-            it.setSizeHint(QSize(lw_w - 4, lw_h - 4))
-            w_item = self.lw.itemWidget(it)
-            if w_item and hasattr(w_item, 'update_size'):
-                w_item.update_size(lw_w - 4, lw_h - 4)
-
-        btn_h = 32
+        self._photo_area = (lw_w, lw_h)
+        self.apply_photo_grid()
         self.btn_add.setFixedHeight(btn_h)
         self.btn_add.setStyleSheet(f"""
             QPushButton {{
@@ -2343,8 +2351,42 @@ class DropZoneCard(QFrame):
             }}
         """)
 
-        card_min_h = max(120, lw_h + btn_h + pad * 2 + 30)
-        self.setMinimumHeight(card_min_h)
+        if h:
+            self.setFixedHeight(h)
+        else:
+            self.setMaximumHeight(16777215)
+            card_min_h = max(120, lw_h + btn_h + pad * 2 + 30)
+            self.setMinimumHeight(card_min_h)
+
+    def photo_columns(self) -> int:
+        """Photos shown side by side: as many portrait-shaped cells as fit."""
+        lw_w, lw_h = self._photo_area
+        # A portrait photo needs about 3/4 of the height in width; a cell a
+        # little narrower only shrinks the photo slightly.
+        fit = max(1, round(lw_w / max(80, lw_h * 0.75)))
+        return max(1, min(self.lw.count(), fit))
+
+    def apply_photo_grid(self) -> None:
+        lw_w, lw_h = self._photo_area
+        count = self.lw.count()
+        columns = self.photo_columns()
+        # More photos than columns scroll vertically; keep room for the bar.
+        scrolls = count > columns
+        # Without this a scroll bar left over from an earlier layout narrows
+        # the view and pushes the last photo of a full row onto a new row.
+        self.lw.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded if scrolls else Qt.ScrollBarAlwaysOff)
+        scrollbar = self.style().pixelMetric(QStyle.PM_ScrollBarExtent) + 2
+        usable_w = lw_w - (scrollbar if scrolls else 0) - 6
+        cell_w = max(60, usable_w // columns)
+        self.lw.setIconSize(QSize(cell_w - 4, lw_h - 4))
+        self.lw.setGridSize(QSize(cell_w, lw_h))
+        for i in range(count):
+            it = self.lw.item(i)
+            it.setSizeHint(QSize(cell_w - 4, lw_h - 4))
+            w_item = self.lw.itemWidget(it)
+            if w_item and hasattr(w_item, 'update_size'):
+                w_item.update_size(cell_w - 4, lw_h - 4)
+        self.lbl_title.setText(self.name + (f" · {count} 张" if count > 1 else ""))
 
     def dragEnterEvent(self, e):
         if accepts_image_drag(e.mimeData()):
@@ -2417,28 +2459,26 @@ class AutoSortDropZone(QFrame):
         self.setObjectName("AutoSortDropZone")
         self.available = bool(available)
         self.setAcceptDrops(self.available)
-        self.setFixedHeight(64)
+        # One line, so the eight slot cards below keep as much height as possible.
+        self.setFixedHeight(46)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 8, 10, 8)
+        layout.setContentsMargins(12, 6, 8, 6)
         layout.setSpacing(10)
         icon = QLabel()
-        icon.setFixedSize(26, 26)
+        icon.setFixedSize(22, 22)
         icon.setStyleSheet("background:transparent; border:none;")
-        icon.setPixmap(app_icon(self, "image", Theme.PRIMARY if self.available else Theme.TEXT_MUTED).pixmap(22, 22))
+        icon.setPixmap(app_icon(self, "image", Theme.PRIMARY if self.available else Theme.TEXT_MUTED).pixmap(18, 18))
         layout.addWidget(icon)
 
-        text = QVBoxLayout()
-        text.setSpacing(1)
         self.lbl_title = QLabel("拖到这里自动分类" if self.available else "自动分类不可用")
         self.lbl_title.setStyleSheet(
             f"font-size:13px; font-weight:800; color:{Theme.TEXT_MAIN}; background:transparent; border:none;"
         )
-        text.addWidget(self.lbl_title)
-        self.lbl_hint = QLabel()
+        layout.addWidget(self.lbl_title)
+        self.lbl_hint = ElidedLabel("")
         self.lbl_hint.setStyleSheet(f"font-size:12px; color:{Theme.TEXT_SEC}; background:transparent; border:none;")
-        text.addWidget(self.lbl_hint)
-        layout.addLayout(text, 1)
+        layout.addWidget(self.lbl_hint, 1)
 
         self.btn_choose = QPushButton("选择图片")
         style_button(self.btn_choose, icon_name="add")
@@ -3332,28 +3372,142 @@ class ImageItemWidget(QWidget):
         self.update_size(e.size().width(), e.size().height())
 
 class ImageViewer(QDialog):
-    def __init__(self, path, parent=None):
+    """Photo viewer: fit or zoom (wheel, +/-, double-click), drag to pan, and
+    ←/→ through every photo of the box in slot order."""
+
+    MIN_ZOOM = 0.05
+    MAX_ZOOM = 8.0
+
+    def __init__(self, path, parent=None, photos=None, index=0):
         super().__init__(parent)
         self.setWindowTitle("查看图片")
-        self.resize(900, 600)
+        self.photos = list(photos) if photos else [(str(path), Path(str(path)).name)]
+        self.index = max(0, min(int(index), len(self.photos) - 1))
+        self.zoom = None  # None = fit to window
+        self.pm = None
+        self._drag_origin = None
+        screen = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1280, 800)
+        self.resize(max(900, int(screen.width() * 0.7)), max(600, int(screen.height() * 0.85)))
+
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        bar = QFrame()
+        bar.setObjectName("viewerBar")
+        bar.setStyleSheet(f"QFrame#viewerBar {{ background:{Theme.BG_MAIN}; border-bottom:1px solid {Theme.BORDER}; }}")
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(12, 6, 12, 6)
+        bar_layout.setSpacing(8)
+        self.btn_prev = QPushButton("上一张")
+        style_button(self.btn_prev, icon_name="collapse")
+        self.btn_prev.setToolTip("上一张（←）")
+        self.btn_prev.clicked.connect(lambda: self.show_photo(self.index - 1))
+        bar_layout.addWidget(self.btn_prev)
+        self.btn_next = QPushButton("下一张")
+        style_button(self.btn_next, icon_name="expand")
+        self.btn_next.setToolTip("下一张（→）")
+        self.btn_next.clicked.connect(lambda: self.show_photo(self.index + 1))
+        bar_layout.addWidget(self.btn_next)
+        self.lbl_caption = ElidedLabel("")
+        self.lbl_caption.setStyleSheet(f"font-size:13px; font-weight:700; color:{Theme.TEXT_MAIN};")
+        bar_layout.addWidget(self.lbl_caption, 1)
+        self.lbl_zoom = QLabel()
+        self.lbl_zoom.setStyleSheet(f"font-size:12px; color:{Theme.TEXT_SEC};")
+        bar_layout.addWidget(self.lbl_zoom)
+        self.btn_fit = QPushButton("适应窗口")
+        style_button(self.btn_fit)
+        self.btn_fit.setToolTip("适应窗口（0）；滚轮或 +/- 缩放，双击切换原始大小，按住拖动查看局部")
+        self.btn_fit.clicked.connect(lambda: self.set_zoom(None))
+        bar_layout.addWidget(self.btn_fit)
+        v.addWidget(bar)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setAlignment(Qt.AlignCenter)
         self.lbl = QLabel()
         self.lbl.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.lbl)
-        v.addWidget(self.scroll)
-        img = QImage(path)
-        if not img.isNull():
-            self.pm = QPixmap.fromImage(img)
-            self.lbl.setPixmap(self.pm.scaled(self.scroll.viewport().size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
+        self.scroll.viewport().installEventFilter(self)
+        v.addWidget(self.scroll, 1)
+        for key, step in ((Qt.Key_Left, -1), (Qt.Key_Right, 1)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(lambda s=step: self.show_photo(self.index + s))
+        for keys, factor in (((Qt.Key_Plus, Qt.Key_Equal), 1.25), ((Qt.Key_Minus,), 0.8)):
+            for key in keys:
+                shortcut = QShortcut(QKeySequence(key), self)
+                shortcut.activated.connect(lambda f=factor: self.zoom_by(f))
+        QShortcut(QKeySequence(Qt.Key_0), self).activated.connect(lambda: self.set_zoom(None))
+        self.show_photo(self.index)
+
+    def show_photo(self, index: int) -> None:
+        if not 0 <= index < len(self.photos):
+            return
+        self.index = index
+        path, caption = self.photos[index]
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        image = reader.read()
+        self.pm = QPixmap.fromImage(image) if not image.isNull() else None
+        counter = f"{index + 1} / {len(self.photos)}  ·  " if len(self.photos) > 1 else ""
+        self.lbl_caption.setText(counter + str(caption))
+        self.btn_prev.setEnabled(index > 0)
+        self.btn_next.setEnabled(index < len(self.photos) - 1)
+        self.zoom = None
+        if self.pm is None:
+            self.lbl.setPixmap(QPixmap())
             self.lbl.setText("无法加载图片")
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if hasattr(self, 'pm'):
-            self.lbl.setPixmap(self.pm.scaled(self.scroll.viewport().size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.lbl_zoom.setText("")
+            return
+        self._render()
+
+    def fit_factor(self) -> float:
+        if self.pm is None or self.pm.isNull():
+            return 1.0
+        area = self.scroll.viewport().size()
+        return min(area.width() / max(1, self.pm.width()), area.height() / max(1, self.pm.height()))
+
+    def current_factor(self) -> float:
+        return self.fit_factor() if self.zoom is None else self.zoom
+
+    def set_zoom(self, factor) -> None:
+        self.zoom = None if factor is None else max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(factor)))
+        self._render()
+
+    def zoom_by(self, ratio: float) -> None:
+        self.set_zoom(self.current_factor() * ratio)
+
+    def _render(self) -> None:
+        if self.pm is None:
+            return
+        factor = self.current_factor()
+        size = QSize(max(1, int(self.pm.width() * factor)), max(1, int(self.pm.height() * factor)))
+        self.lbl.setPixmap(self.pm.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.lbl_zoom.setText(f"{factor:.0%}" + ("（适应窗口）" if self.zoom is None else ""))
+
+    def eventFilter(self, obj, event):
+        if obj is self.scroll.viewport() and self.pm is not None:
+            kind = event.type()
+            if kind == QEvent.Wheel:
+                self.zoom_by(1.25 if event.angleDelta().y() > 0 else 0.8)
+                return True
+            if kind == QEvent.MouseButtonDblClick:
+                self.set_zoom(1.0 if self.zoom is None else None)
+                return True
+            if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._drag_origin = (event.position().toPoint(), self.scroll.horizontalScrollBar().value(),
+                                     self.scroll.verticalScrollBar().value())
+                return True
+            if kind == QEvent.MouseMove and self._drag_origin is not None:
+                origin, h_value, v_value = self._drag_origin
+                delta = event.position().toPoint() - origin
+                self.scroll.horizontalScrollBar().setValue(h_value - delta.x())
+                self.scroll.verticalScrollBar().setValue(v_value - delta.y())
+                return True
+            if kind == QEvent.MouseButtonRelease:
+                self._drag_origin = None
+            if kind == QEvent.Resize and self.zoom is None:
+                self._render()
+        return super().eventFilter(obj, event)
 
 
 def task_issue_reason(data: dict) -> str:
@@ -3389,6 +3543,57 @@ def size_type_badge_state(size_type: str) -> str:
     if prefix in {"25", "40", "42"}:
         return "ok"
     return "neutral"
+
+
+class SlotStrip(QWidget):
+    """One small numbered square per photo slot, so a row shows at a glance
+    which photos a box still needs: filled = has photos, amber = required but
+    empty, faint = optional and empty. Painted, not built from child widgets,
+    because the task list can hold hundreds of rows."""
+
+    CELL = 17
+    GAP = 3
+    GROUP_GAP = 8  # between the door/loading photos 1-5 and the extras 6-8
+
+    def __init__(self, counts, required, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.counts = {int(key): int(value) for key, value in (counts or {}).items()}
+        self.required = {int(category) for category in (required or [])}
+        cells = len(ALL_CATEGORIES)
+        self.setFixedSize(cells * self.CELL + (cells - 2) * self.GAP + self.GROUP_GAP, self.CELL)
+        have = [str(idx) for idx, _ in ALL_CATEGORIES if self.counts.get(idx)]
+        need = [str(idx) for idx, _ in ALL_CATEGORIES if idx in self.required and not self.counts.get(idx)]
+        self.setAccessibleName(f"已有 {','.join(have) or '无'}；缺 {','.join(need) or '无'}")
+
+    def cell_state(self, idx: int) -> str:
+        if self.counts.get(idx):
+            return "done"
+        return "missing" if idx in self.required else "optional"
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        font = painter.font()
+        font.setPixelSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        styles = {
+            "done": (Theme.SUCCESS, Theme.SUCCESS, Theme.BG_MAIN),
+            "missing": (Theme.WARNING_SOFT, Theme.WARNING, Theme.WARNING),
+            "optional": (None, Theme.BORDER_HOVER, Theme.TEXT_MUTED),
+        }
+        x = 0
+        for idx, _name in ALL_CATEGORIES:
+            fill, border, text = styles[self.cell_state(idx)]
+            rect = QRect(x, 0, self.CELL - 1, self.CELL - 1)
+            painter.setPen(QPen(QColor(border), 1))
+            painter.setBrush(QBrush(QColor(fill)) if fill else Qt.NoBrush)
+            painter.drawRoundedRect(rect, 4, 4)
+            painter.setPen(QColor(text))
+            painter.drawText(rect, Qt.AlignCenter, str(idx))
+            x += self.CELL + (self.GROUP_GAP if idx == 5 else self.GAP)
+        painter.end()
 
 
 class TaskRowWidget(QFrame):
@@ -3454,6 +3659,11 @@ class TaskRowWidget(QFrame):
             f"OCR 箱型：{ocr_size_type or '尚未识别'}；颜色仅区分箱型类别，不表示核对通过"
         )
         content_layout.addWidget(self.size_type_label, 0, 1, Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.slot_strip = None
+        if "category_counts" in data:
+            self.slot_strip = SlotStrip(data.get("category_counts"), data.get("required_categories"), content)
+            content_layout.addWidget(self.slot_strip, 0, 2, Qt.AlignLeft | Qt.AlignVCenter)
 
         verification_status = data.get("ocr_status", "")
         verification_badges = {
@@ -3748,6 +3958,7 @@ class OcrResultDialog(QDialog):
 class BoxDetailWindow(QWidget):
     data_changed = Signal()
     back_requested = Signal()
+    navigate_requested = Signal(int)
 
     def __init__(self, root_dir, box_name, parent=None):
         super().__init__(parent)
@@ -3785,7 +3996,8 @@ class BoxDetailWindow(QWidget):
         self.meta = {}
         self.load_meta()
         self.min_w = 190
-        self.max_w = 380
+        self.max_w = 560
+        self.min_card_h = 210
         self.init_ui()
 
     def load_meta(self):
@@ -4207,7 +4419,25 @@ class BoxDetailWindow(QWidget):
         self.lbl_name.setToolTip(str(self.box_dir))
         self.lbl_name.setStyleSheet(f"font-size:17px; font-weight:800; color:{Theme.TEXT_MAIN};")
         primary_row.addWidget(self.lbl_name)
+        self.lbl_position = QLabel()
+        self.lbl_position.setStyleSheet(f"font-size:12px; color:{Theme.TEXT_MUTED};")
+        self.lbl_position.setToolTip("在当前任务列表（含筛选和排序）中的位置")
+        primary_row.addWidget(self.lbl_position)
         primary_row.addStretch()
+
+        self.btn_prev_box = QPushButton("上一箱")
+        style_button(self.btn_prev_box, icon_name="collapse")
+        self.btn_prev_box.setFixedHeight(34)
+        self.btn_prev_box.setToolTip("打开列表中的上一个箱子（PgUp）")
+        self.btn_prev_box.clicked.connect(lambda: self.navigate_requested.emit(-1))
+        primary_row.addWidget(self.btn_prev_box)
+        self.btn_next_box = QPushButton("下一箱")
+        style_button(self.btn_next_box, icon_name="expand")
+        self.btn_next_box.setFixedHeight(34)
+        self.btn_next_box.setToolTip("打开列表中的下一个箱子（PgDn）")
+        self.btn_next_box.clicked.connect(lambda: self.navigate_requested.emit(1))
+        primary_row.addWidget(self.btn_next_box)
+        self.set_navigation(0, 0)
 
         self.btn_next_missing = QPushButton("下一缺失项")
         style_button(self.btn_next_missing, icon_name="expand")
@@ -4313,6 +4543,9 @@ class BoxDetailWindow(QWidget):
         set_solid_background(scroll, Theme.BG_MAIN)
         scroll.setWidget(self.main_widget)
         scroll.viewport().setObjectName("detailViewport")
+        # The banner or a window resize changes the viewport height, which the
+        # fit-to-screen card height depends on.
+        scroll.viewport().installEventFilter(self)
         set_solid_background(scroll.viewport(), Theme.BG_MAIN)
         layout.addWidget(scroll)
         self.scroll_area = scroll
@@ -4323,10 +4556,18 @@ class BoxDetailWindow(QWidget):
         self.back_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
         self.back_shortcut.setContext(Qt.WindowShortcut)
         self.back_shortcut.activated.connect(self.back_requested.emit)
+        self.prev_box_shortcut = QShortcut(QKeySequence(Qt.Key_PageUp), self)
+        self.prev_box_shortcut.setContext(Qt.WindowShortcut)
+        self.prev_box_shortcut.activated.connect(lambda: self.navigate_requested.emit(-1))
+        self.next_box_shortcut = QShortcut(QKeySequence(Qt.Key_PageDown), self)
+        self.next_box_shortcut.setContext(Qt.WindowShortcut)
+        self.next_box_shortcut.activated.connect(lambda: self.navigate_requested.emit(1))
         effective = self.get_effective_reqs()
         initial = next((idx for idx in effective if not self.meta.get(str(idx), [])), effective[0] if effective else 1)
         self.select_category(initial)
-        self.setTabOrder(self.btn_back, self.btn_next_missing)
+        self.setTabOrder(self.btn_back, self.btn_prev_box)
+        self.setTabOrder(self.btn_prev_box, self.btn_next_box)
+        self.setTabOrder(self.btn_next_box, self.btn_next_missing)
         self.setTabOrder(self.btn_next_missing, self.btn_ocr)
         self.setTabOrder(self.btn_ocr, self.btn_more)
         self.setTabOrder(self.btn_more, self.auto_sort_zone.btn_choose)
@@ -4345,6 +4586,20 @@ class BoxDetailWindow(QWidget):
 
     def get_effective_reqs(self):
         return self.box_reqs if self.box_reqs is not None else self.reqs
+
+    def set_navigation(self, position: int, total: int) -> None:
+        """Show "position / total" and enable the previous/next box buttons."""
+        self.lbl_position.setText(f"{position} / {total}" if position and total else "")
+        self.btn_prev_box.setEnabled(position > 1)
+        self.btn_next_box.setEnabled(0 < position < total)
+
+    def has_pending_saves(self) -> bool:
+        return bool(
+            self._image_import_task is not None
+            or self._image_import_queue
+            or self._auto_sort_task is not None
+            or self._auto_sort_queue
+        )
 
     def update_box_title(self):
         size_type = self.ocr_result.get("size_type", "") if self.ocr_result else ""
@@ -4445,22 +4700,42 @@ class BoxDetailWindow(QWidget):
         margin_total = dyn_margin * 2
         spacing = dyn_spacing
 
-        best_w = self.max_w
-        for cols in range(4, 0, -1):
-            w = (vw - margin_total - spacing * (cols - 1)) // cols
-            if w >= self.min_w:
-                best_w = min(w, self.max_w)
-                break
-        else:
-            best_w = max(self.min_w, vw - margin_total)
+        def column_width(available):
+            for cols in range(4, 0, -1):
+                # One pixel spare: FlowLayout wraps a row that ends exactly on the edge.
+                w = (available - margin_total - spacing * (cols - 1) - 1) // cols
+                if w >= self.min_w:
+                    return cols, w
+            return 1, max(self.min_w, available - margin_total)
+
+        # Fit every card on screen (e.g. 4 x 2 at 1366x768) when the cards
+        # stay usable; otherwise let them keep a 4:3 photo area and scroll.
+        cols, best_w = column_width(vw)
+        rows = -(-len(self.cards) // cols)
+        vh = self.scroll_area.viewport().height()
+        fit_h = (vh - margin_total - spacing * (rows - 1)) // rows
+        card_h = fit_h if fit_h >= self.min_card_h else None
+        if card_h is None and not self.scroll_area.verticalScrollBar().isVisible():
+            # The scroll bar is about to take some width; size for it now so
+            # the last card in a row does not wrap to an extra row.
+            cols, best_w = column_width(vw - self.style().pixelMetric(QStyle.PM_ScrollBarExtent))
+        best_w = min(best_w, self.max_w)
 
         for c in self.cards.values():
-            c.set_card_width(best_w)
+            c.set_card_size(best_w, card_h)
         self.flow_layout.invalidate()
         self.flow_layout.setGeometry(self.main_widget.rect())
         self.main_widget.updateGeometry()
 
         compact_header = self.width() < 760
+        for button, text in ((self.btn_prev_box, "上一箱"), (self.btn_next_box, "下一箱")):
+            button.setText("" if compact_header else text)
+            if compact_header:
+                button.setFixedWidth(34)
+            else:
+                button.setMinimumWidth(0)
+                button.setMaximumWidth(16777215)
+            button.setVisible(self.width() >= 560)
         self.btn_next_missing.setText("" if compact_header else "下一缺失项")
         if compact_header:
             self.btn_next_missing.setFixedWidth(34)
@@ -4471,6 +4746,17 @@ class BoxDetailWindow(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.apply_responsive_layout()
+
+    def eventFilter(self, obj, event):
+        scroll_area = getattr(self, "scroll_area", None)
+        if (
+            event.type() == QEvent.Resize
+            and scroll_area is not None
+            and obj is scroll_area.viewport()
+            and not self._page_disposed
+        ):
+            self.apply_responsive_layout()
+        return super().eventFilter(obj, event)
 
     def _use_background_image_import(self) -> bool:
         # Offscreen tests keep their historical synchronous public contract;
@@ -5078,6 +5364,7 @@ class BoxDetailWindow(QWidget):
             c.lw.addItem(it)
             w = ImageItemWidget(f, self.box_dir, True)
             c.lw.setItemWidget(it, w)
+        c.apply_photo_grid()
         c.set_state("complete" if self.meta.get(str(idx), []) else "empty")
         c.lw.update()
 
@@ -5177,7 +5464,15 @@ class BoxDetailWindow(QWidget):
     def preview(self, it, w, idx):
         wi = w.itemWidget(it)
         fn = wi.path if wi else it.text()
-        dlg = ImageViewer(str(self.box_dir / fn), self)
+        photos, index = [], 0
+        for category, label in ALL_CATEGORIES:
+            for name in self.meta.get(str(category), []):
+                if category == idx and name == fn:
+                    index = len(photos)
+                photos.append((str(self.box_dir / name), f"{label} · {name}"))
+        if not photos:
+            photos = [(str(self.box_dir / fn), fn)]
+        dlg = ImageViewer(str(self.box_dir / fn), self, photos=photos, index=index)
         dlg.exec()
 
     def update_stat(self):
@@ -9058,6 +9353,10 @@ class ContainerApp(QMainWindow):
             detail = BoxDetailWindow(self.root, box_name, self)
             detail.data_changed.connect(lambda name=box_name: self._mark_detail_dirty(name))
             detail.back_requested.connect(self.on_back_to_dashboard)
+            detail.navigate_requested.connect(self.open_adjacent_box)
+            names = self._navigation_names()
+            if box_name in names:
+                detail.set_navigation(names.index(box_name) + 1, len(names))
             self._detail_page = detail
             self.stack.addWidget(detail)
             self.stack.setCurrentWidget(detail)
@@ -9073,6 +9372,33 @@ class ContainerApp(QMainWindow):
                 "任务详情没有打开。请确认任务目录仍存在，并运行数据检查。",
                 str(e),
             )
+
+    def _navigation_names(self) -> list:
+        """Box order for 上一箱/下一箱: the task list as filtered and sorted now."""
+        names = [self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())]
+        return [str(name) for name in names if name]
+
+    def open_adjacent_box(self, step: int) -> None:
+        detail = self._detail_page
+        if detail is None:
+            return
+        if detail.has_pending_saves():
+            self.show_toast("照片还在保存，保存完再切换箱子")
+            return
+        names = self._navigation_names()
+        if detail.box_name not in names:
+            self.show_toast("当前箱子不在任务列表的筛选结果里")
+            return
+        index = names.index(detail.box_name) + int(step)
+        if not 0 <= index < len(names):
+            self.show_toast("已经是第一个箱子" if step < 0 else "已经是最后一个箱子")
+            return
+        target = names[index]
+        self.open_box_name(target)
+        item = self.list.item(index)
+        if item is not None and item.data(Qt.UserRole) == target:
+            self.list.setCurrentItem(item)
+            self.list.scrollToItem(item)
 
     def on_back_to_dashboard(self):
         target = getattr(self, "_detail_return_page", self.dashboard_page)
