@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PhotoCollect 群晖更新中心速查表</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">PhotoCollect · Reference</p>
+  <h1>群晖更新中心速查表</h1>
+  <p class="lede">当前群晖地址已确认为 192.168.110.79。本页适合日常发布、检查和故障定位。</p>
+
+  <h2>目录与端口</h2>
+  <table>
+    <tbody>
+      <tr><th>项目工作目录</th><td><code>/volume1/docker/photocollect-update-center</code>（只放 Compose）</td></tr>
+      <tr><th>更新文件</th><td><code>/volume1/PhotoCollectUpdates/releases</code></td></tr>
+      <tr><th>ntfy 数据</th><td><code>/volume1/PhotoCollectUpdates/ntfy</code></td></tr>
+      <tr><th>静态下载</th><td><code>http://192.168.110.79:18080/</code></td></tr>
+      <tr><th>推送服务</th><td><code>http://192.168.110.79:18081/</code></td></tr>
+      <tr><th>健康检查</th><td><code>http://192.168.110.79:18081/v1/health</code></td></tr>
+      <tr><th>通知 topic</th><td><code>photocollect-updates</code></td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <strong>不要拼接路径：</strong>项目工作目录在 <code>/volume1/docker</code>
+    不代表更新数据也在那里。出现 <code>Bind mount failed</code> 时，先确认 Compose
+    左侧的宿主目录已在 File Station 中真实创建。
+  </div>
+
+  <h2>权限模型</h2>
+  <table>
+    <thead><tr><th>身份</th><th>权限</th><th>保存位置</th></tr></thead>
+    <tbody>
+      <tr><td>publisher</td><td>topic write-only</td><td>Windows 一键发布端</td></tr>
+      <tr><td>client</td><td>topic read-only</td><td>PhotoCollect 客户端</td></tr>
+      <tr><td>anonymous</td><td>deny-all</td><td>不保存</td></tr>
+    </tbody>
+  </table>
+
+  <h2>ntfy 管理命令</h2>
+  <p>Container Manager 终端命令使用 <code>/bin/sh</code>，不要使用 <code>/bin/bash</code>。</p>
+  <pre>ntfy user list
+ntfy access
+ntfy token list publisher
+ntfy token list client
+ntfy user change-pass publisher
+ntfy user change-pass client</pre>
+
+  <h2>Windows 验证</h2>
+  <pre>Invoke-WebRequest "http://192.168.110.79:18080/health.txt"
+Invoke-RestMethod "http://192.168.110.79:18081/v1/health"</pre>
+
+  <h2>日常发布</h2>
+  <ol>
+    <li>把有效的 publisher 令牌复制到 Windows 剪贴板。</li>
+    <li>双击项目根目录的 <code>一键发布到群晖.bat</code>。</li>
+    <li>核对版本、来源、大小和 SHA-256，输入 <code>PUBLISH</code>。</li>
+    <li>看到“发布成功”后打开 <code>http://192.168.110.79:18080/</code>。</li>
+  </ol>
+  <p>脚本只接受与最新 EXE 验收报告完全匹配的文件；先上传版本化 EXE，再更新
+    <code>latest.json</code>，最后发送 <code>release.ready</code> 通知。</p>
+
+  <h2>安全底线</h2>
+  <ul>
+    <li>18080/18081 仅允许可信局域网，不映射公网。</li>
+    <li>更新共享目录只有发布账号可写，客户端通过 HTTP 只读。</li>
+    <li>publisher/client 令牌分离，不放进 Compose、截图或聊天记录。</li>
+    <li>更新包必须验证长度、SHA-256；正式客户端还应验证签名。</li>
+    <li>至少保留当前版和上一已验证版本，当前用于手动回滚；客户端自动回滚尚未接入。</li>
+  </ul>
+
+  <div class="next">
+    <a class="button" href="../lessons/0001-synology-update-center.html">返回完整教程</a>
+    <a class="button secondary" href="../lessons/0002-publish-release.html">查看一键发布课</a>
+  </div>
+</main>
+</body>
+</html>

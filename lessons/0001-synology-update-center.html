@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>群晖 PhotoCollect 更新中心部署教程</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">PhotoCollect · Lesson 0001</p>
+  <h1>在群晖部署局域网更新中心</h1>
+  <p class="lede">完成后，群晖会持续提供更新文件和实时通知通道；Windows 电脑负责构建并发布，同事电脑只负责安全下载。</p>
+
+  <div class="callout warn">
+    <strong>先明确边界：</strong>本课只搭建群晖服务器基础。当前桌面版 v5.15.2 尚未接入自动更新，不能因为容器启动成功就认为客户端已经会更新。客户端、增量包和一键发布需要在后续版本接入。
+  </div>
+
+  <h2>最终结构</h2>
+  <pre>Windows 发布电脑
+    │  SMB 上传完整包、增量包、latest.json
+    ▼
+群晖
+    ├─ NGINX :18080  只读提供更新文件
+    └─ ntfy  :18081  推送“有新版本，请检查”
+                           │
+                           ▼
+                    PhotoCollect 客户端</pre>
+
+  <h2>开始前准备</h2>
+  <ul>
+    <li>确认群晖已安装 <strong>Container Manager</strong>。</li>
+    <li>群晖固定局域网 IP 已确认为 <code>192.168.110.79</code>。</li>
+    <li>确认实际卷名。多数机器是 <code>/volume1</code>，也可能是 <code>/volume2</code>。</li>
+    <li>确认端口 <code>18080</code> 和 <code>18081</code> 未被其他程序占用。</li>
+  </ul>
+
+  <h2>第一部分：准备目录</h2>
+
+  <div class="step">
+    <div class="step-number">1</div>
+    <div class="step-body">
+      <h3>创建共享文件夹</h3>
+      <p>打开 DSM 的<strong>控制面板 → 共享文件夹 → 新增</strong>，名称填：</p>
+      <pre>PhotoCollectUpdates</pre>
+      <p>建议开启回收站。管理员拥有读写权限；普通同事不需要 SMB 写入权限。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">2</div>
+    <div class="step-body">
+      <h3>创建两个子目录</h3>
+      <p>打开 File Station，在共享文件夹中创建：</p>
+      <pre>/volume1/PhotoCollectUpdates/releases
+/volume1/PhotoCollectUpdates/ntfy</pre>
+      <p><code>releases</code> 存更新包，容器只读；<code>ntfy</code> 存通知缓存、用户和权限数据库，容器必须可写。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">3</div>
+    <div class="step-body">
+      <h3>放一个测试文件</h3>
+      <p>在 Windows 新建 <code>health.txt</code>，内容只有 <code>ok</code>，上传到 <code>releases</code>。稍后用它验证静态文件服务。</p>
+    </div>
+  </div>
+
+  <h2>第二部分：创建 Container Manager 项目</h2>
+
+  <div class="step">
+    <div class="step-number">4</div>
+    <div class="step-body">
+      <h3>新建项目</h3>
+      <p>打开<strong>Container Manager → 项目 → 新增</strong>：</p>
+      <ul>
+        <li>项目名称：<code>photocollect-update-center</code></li>
+        <li>路径：选择一个项目工作目录，例如 <code>/volume1/docker/photocollect-update-center</code></li>
+        <li>来源：选择“使用编辑器创建 docker-compose.yml”</li>
+      </ul>
+      <div class="callout warn">
+        <strong>项目目录和更新数据目录不是同一个目录。</strong>
+        项目目录只保存 Compose；下面的卷挂载仍应使用
+        <code>/volume1/PhotoCollectUpdates/releases</code> 和
+        <code>/volume1/PhotoCollectUpdates/ntfy</code>。不要因为项目放在
+        <code>/volume1/docker</code>，就自动给数据路径也加上 <code>/docker</code>。
+      </div>
+      <p>群晖官方也支持上传现成 Compose 文件。<a href="https://kb.synology.com/en-us/DSM/help/ContainerManager/docker_project">查看官方步骤</a>。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">5</div>
+    <div class="step-body">
+      <h3>粘贴 Compose</h3>
+      <p>下面已经使用当前群晖地址 <code>192.168.110.79</code> 和数据卷 <code>/volume1</code>：</p>
+      <pre>name: photocollect-update-center
+
+services:
+  files:
+    image: nginx:1.29.8-alpine
+    container_name: photocollect-files
+    restart: unless-stopped
+    ports:
+      - "18080:80"
+    volumes:
+      - /volume1/PhotoCollectUpdates/releases:/usr/share/nginx/html:ro
+
+  notify:
+    image: binwiederhier/ntfy:v2.26.3
+    container_name: photocollect-notify
+    restart: unless-stopped
+    command:
+      - serve
+    environment:
+      TZ: Asia/Shanghai
+      NTFY_BASE_URL: http://192.168.110.79:18081
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+      NTFY_ENABLE_LOGIN: "true"
+    ports:
+      - "18081:80"
+    volumes:
+      - /volume1/PhotoCollectUpdates/ntfy:/var/lib/ntfy</pre>
+      <div class="callout">
+        镜像版本已固定，避免某天自动拉到不兼容的 <code>latest</code>。以后升级容器时，先备份 <code>ntfy</code> 目录，再显式修改版本号。
+      </div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">6</div>
+    <div class="step-body">
+      <h3>构建并启动</h3>
+      <p>确认摘要后勾选“完成后启动项目”。首次需要下载镜像，等待两个容器都显示 <strong>Running</strong>。</p>
+      <p>如果持续重启，打开<strong>项目 → 详情 → 日志</strong>。最常见原因是卷名写错、目录不存在、<code>ntfy</code> 目录无写权限或端口被占用。</p>
+    </div>
+  </div>
+
+  <h2>第三部分：创建推送账号与权限</h2>
+
+  <div class="callout danger">
+    ntfy 默认允许匿名读写。本 Compose 已设置 <code>deny-all</code>；没有创建用户前，任何推送请求被拒绝是正常且安全的。
+  </div>
+
+  <div class="step">
+    <div class="step-number">7</div>
+    <div class="step-body">
+      <h3>进入通知容器终端</h3>
+      <p>打开<strong>Container Manager → 容器 → photocollect-notify → 详情 → 终端</strong>，点击“新增”旁的下拉按钮，用命令 <code>/bin/sh</code> 创建终端。不要使用默认的 <code>/bin/bash</code>；ntfy 的 Alpine 精简镜像没有 bash。</p>
+      <p>先查看已有用户，再只创建缺少的账号：</p>
+      <pre>ntfy user list
+ntfy user add publisher
+ntfy user add client
+ntfy access publisher photocollect-updates write-only
+ntfy access client photocollect-updates read-only
+ntfy access</pre>
+      <p>如果 <code>ntfy user list</code> 已显示某个账号，就跳过对应的 <code>user add</code>，避免重复。新增账号时会要求输入密码。<code>publisher</code> 只能发通知，<code>client</code> 只能收通知。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">8</div>
+    <div class="step-body">
+      <h3>生成两个令牌</h3>
+      <pre>ntfy token add --label="PhotoCollect publisher" publisher
+ntfy token add --label="PhotoCollect client" client
+ntfy token list publisher
+ntfy token list client</pre>
+      <p>只有 <code>token add ... 用户名</code> 创建并且能在该用户名的列表中看到的令牌才可用于认证；<code>token generate</code> 只产生随机字符串，不会自动绑定账号。立即把返回的两个 <code>tk_...</code> 分开保存在密码管理器。发布端只保存 publisher 令牌；客户端只保存 client 令牌。不要把令牌写进公开的 Compose、命令提示文字或截图。</p>
+    </div>
+  </div>
+
+  <h2>第四部分：逐项验证</h2>
+
+  <div class="step">
+    <div class="step-number">9</div>
+    <div class="step-body">
+      <h3>验证文件服务器</h3>
+      <p>在同一局域网的 Windows 浏览器打开：</p>
+      <pre>http://192.168.110.79:18080/health.txt</pre>
+      <p>页面应显示 <code>ok</code>。也可以运行：</p>
+      <pre>Invoke-WebRequest "http://192.168.110.79:18080/health.txt" |
+  Select-Object StatusCode, Content</pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">10</div>
+    <div class="step-body">
+      <h3>验证通知服务健康</h3>
+      <pre>Invoke-RestMethod "http://192.168.110.79:18081/v1/health"</pre>
+      <p>正确结果应包含：</p>
+      <pre>{"healthy":true}</pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">11</div>
+    <div class="step-body">
+      <h3>验证实时推送</h3>
+      <p>先在群晖终端复制 client 令牌，再打开第一个 PowerShell。下面的命令从剪贴板读取令牌、去除首尾空白并立即清空剪贴板，不需要把令牌写进命令：</p>
+      <pre>$clientToken = (Get-Clipboard -Raw).Trim()
+Set-Clipboard -Value ""
+[pscustomobject]@{
+  PrefixOK = $clientToken.StartsWith("tk_")
+  Length   = $clientToken.Length
+}
+curl.exe -sS -o NUL -w "HTTP %{http_code}`n" `
+  -H "Authorization: Bearer $clientToken" `
+  "http://192.168.110.79:18081/photocollect-updates/json?poll=1"
+
+# 上一条返回 HTTP 200 后，再开始持续订阅
+curl.exe -N `
+  -H "Authorization: Bearer $clientToken" `
+  "http://192.168.110.79:18081/photocollect-updates/json"</pre>
+      <p>复制 publisher 令牌，再打开第二个 PowerShell：</p>
+      <pre>$publisherToken = (Get-Clipboard -Raw).Trim()
+Set-Clipboard -Value ""
+[pscustomobject]@{
+  PrefixOK = $publisherToken.StartsWith("tk_")
+  Length   = $publisherToken.Length
+}
+curl.exe -sS -o NUL -w "HTTP %{http_code}`n" `
+  -X POST `
+  -H "Authorization: Bearer $publisherToken" `
+  -H "Content-Type: text/plain; charset=utf-8" `
+  --data-binary "release.ready test-001" `
+  "http://192.168.110.79:18081/photocollect-updates"</pre>
+      <p>第二个窗口应返回 HTTP 200；第一个窗口应立即出现一行 JSON，其中包含 <code>"event":"message"</code> 和 <code>"message":"release.ready test-001"</code>。</p>
+    </div>
+  </div>
+
+  <h2>第五部分：限制为局域网访问</h2>
+  <p>进入<strong>控制面板 → 安全性 → 防火墙</strong>。添加规则，仅允许公司局域网网段访问 TCP <code>18080</code> 和 <code>18081</code>，例如 <code>192.168.1.0/24</code>。把允许规则放在拒绝规则之前。</p>
+  <ul>
+    <li>不要在路由器上做公网端口转发。</li>
+    <li>不要给 <code>Everyone</code> 共享目录写权限。</li>
+    <li>如果公司有访客 Wi-Fi，应确保访客网不能访问这两个端口。</li>
+    <li>正式使用 Basic Auth 或令牌前，建议在 DSM 反向代理中加 HTTPS；HTTP 中的令牌不会被加密。</li>
+  </ul>
+
+  <h2>验收清单</h2>
+  <div class="progress"><span data-progress-bar></span></div>
+  <p class="progress-label" data-progress-label></p>
+  <div class="checklist" data-checklist data-storage-key="photocollect-synology-lesson-0001">
+    <label class="check-item"><input type="checkbox">两个容器均为 Running，日志没有持续报错</label>
+    <label class="check-item"><input type="checkbox"><code>:18080/health.txt</code> 返回 HTTP 200 和 <code>ok</code></label>
+    <label class="check-item"><input type="checkbox"><code>:18081/v1/health</code> 返回 <code>{"healthy":true}</code></label>
+    <label class="check-item"><input type="checkbox">publisher 发出的测试消息能被 client 实时收到</label>
+    <label class="check-item"><input type="checkbox">DSM 防火墙只允许可信局域网访问 18080/18081</label>
+  </div>
+  <div class="callout good" data-complete-message hidden>
+    <strong>群晖更新中心基础已完成。</strong>下一步先发布一个经过验收的完整版本，再接入客户端自动检查、后台下载和退出后替换。
+  </div>
+
+  <h2>常见故障</h2>
+  <table>
+    <thead>
+      <tr><th>现象</th><th>优先检查</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>容器反复重启</td><td>项目日志；卷名、目录是否存在；ntfy 目录是否可写</td></tr>
+      <tr><td><code>Bind mount failed</code></td><td>宿主路径必须预先存在；不要混淆 <code>/volume1/docker/项目目录</code> 与 <code>/volume1/PhotoCollectUpdates/数据目录</code></td></tr>
+      <tr><td><code>/bin/bash: no such file</code></td><td>删除失败的 bash 会话，重新用 <code>/bin/sh</code> 创建终端</td></tr>
+      <tr><td>18080 拒绝连接</td><td>files 容器状态、端口是否被占用、DSM 防火墙</td></tr>
+      <tr><td>health.txt 返回 404</td><td>文件是否位于 releases 根目录、挂载路径是否一致</td></tr>
+      <tr><td>ntfy 返回 401/403</td><td>令牌所属用户、topic 拼写、publisher/client ACL</td></tr>
+      <tr><td>订阅窗口没有消息</td><td>client 是否有 read-only 权限、curl 是否携带 client 令牌</td></tr>
+      <tr><td>NAS 重启后没恢复</td><td>Compose 是否为两个服务设置 <code>restart: unless-stopped</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="next">
+    <a class="button" href="0002-publish-release.html">继续：一键发布</a>
+    <a class="button" href="../reference/synology-update-center-cheatsheet.html">打开一页速查表</a>
+    <a class="button secondary" href="https://kb.synology.com/en-us/DSM/help/ContainerManager/docker_project">群晖官方项目说明</a>
+    <a class="button secondary" href="https://docs.ntfy.sh/config/">ntfy 官方权限说明</a>
+  </div>
+
+  <p class="callout">做到任何一步不一致时，先停在该步，把容器日志或截图发给 Codex，不要用 <code>chmod 777</code> 或关闭全部防火墙来绕过问题。</p>
+</main>
+<script src="../assets/checklist.js"></script>
+</body>
+</html>

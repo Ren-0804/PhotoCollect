@@ -1,0 +1,280 @@
+:root {
+  color-scheme: light;
+  --ink: #172033;
+  --muted: #5b6578;
+  --line: #dbe2ec;
+  --paper: #ffffff;
+  --wash: #f4f7fb;
+  --brand: #1769e0;
+  --brand-soft: #eaf2ff;
+  --good: #087a52;
+  --good-soft: #e8f7f0;
+  --warn: #98620a;
+  --warn-soft: #fff6dc;
+  --bad: #a13535;
+  --bad-soft: #fff0f0;
+  --code: #111827;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--wash);
+  color: var(--ink);
+  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  line-height: 1.7;
+}
+
+main {
+  width: min(940px, calc(100% - 32px));
+  margin: 34px auto 80px;
+  padding: 48px 56px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  box-shadow: 0 18px 54px rgba(31, 45, 74, 0.08);
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  margin: 0 0 10px;
+  font-size: clamp(30px, 5vw, 48px);
+}
+
+h2 {
+  margin: 46px 0 16px;
+  padding-top: 8px;
+  font-size: 26px;
+  border-top: 1px solid var(--line);
+}
+
+h3 {
+  margin: 28px 0 10px;
+  font-size: 19px;
+}
+
+p,
+li {
+  font-size: 16px;
+}
+
+a {
+  color: var(--brand);
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  color: var(--brand);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.lede {
+  max-width: 720px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 19px;
+}
+
+.callout {
+  margin: 22px 0;
+  padding: 16px 18px;
+  border-left: 4px solid var(--brand);
+  border-radius: 8px;
+  background: var(--brand-soft);
+}
+
+.callout.warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.callout.danger {
+  border-color: var(--bad);
+  background: var(--bad-soft);
+}
+
+.callout.good {
+  border-color: var(--good);
+  background: var(--good-soft);
+}
+
+.step {
+  display: grid;
+  grid-template-columns: 46px 1fr;
+  gap: 16px;
+  margin: 20px 0;
+}
+
+.step-number {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--brand);
+  color: #fff;
+  font-weight: 800;
+}
+
+.step-body > :first-child {
+  margin-top: 4px;
+}
+
+pre {
+  overflow-x: auto;
+  margin: 14px 0;
+  padding: 18px;
+  border-radius: 12px;
+  background: var(--code);
+  color: #f8fafc;
+  font: 13px/1.55 Consolas, "Cascadia Mono", monospace;
+}
+
+code {
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+
+:not(pre) > code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: #edf1f7;
+  color: #263248;
+}
+
+.checklist {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.check-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.check-item input {
+  width: 18px;
+  height: 18px;
+  margin-top: 3px;
+  accent-color: var(--good);
+}
+
+.progress {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #e7ebf1;
+}
+
+.progress > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--good);
+  transition: width 180ms ease;
+}
+
+.progress-label {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: var(--muted);
+  font-size: 13px;
+  text-transform: uppercase;
+}
+
+.next {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 36px;
+}
+
+.button {
+  display: inline-block;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--brand);
+  color: #fff;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.button.secondary {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+}
+
+@media (max-width: 700px) {
+  main {
+    margin: 0;
+    padding: 28px 20px 60px;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .step {
+    grid-template-columns: 36px 1fr;
+  }
+
+  .step-number {
+    width: 34px;
+    height: 34px;
+  }
+}
+
+@media print {
+  body {
+    background: #fff;
+  }
+
+  main {
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .check-item {
+    break-inside: avoid;
+  }
+
+  a {
+    color: inherit;
+  }
+}

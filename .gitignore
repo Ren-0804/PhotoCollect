@@ -1,0 +1,29 @@
+# 构建与发布产物
+dist/
+build/
+outputs/
+*.exe
+*.exe.new
+*.previous
+
+# 本地安全备份与缓存
+.safety-backups/
+__pycache__/
+.pytest_cache/
+
+# 授权服务端在单独的私有仓库
+license-api/
+
+# 本地 Agent 工具目录
+.agents/
+.codex/
+.claude/
+
+# 旧版 con.py 快照（v5.14.2）
+111.py
+222.py
+333.py
+666.py
+777.py
+888.py
+999.py

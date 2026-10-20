@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PhotoCollect 一键发布到群晖</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">PhotoCollect · Lesson 0002</p>
+  <h1>发布一个经过验收的完整版本</h1>
+  <p class="lede">本课完成一个具体结果：把当前验收通过的 PhotoCollect EXE 上传到群晖，生成下载页和版本清单，并发送更新通知。</p>
+
+  <div class="callout warn">
+    当前 PhotoCollect 客户端还没有自动下载和退出替换功能。因此本课发布完成后，同事先通过局域网下载页手动更新；自动更新和增量包属于下一阶段。
+  </div>
+
+  <h2>发布前准备</h2>
+  <ul>
+    <li>群晖 <code>192.168.110.79</code> 和两个容器保持运行。</li>
+    <li>Windows 能访问 <code>\\192.168.110.79\PhotoCollectUpdates\releases</code>。</li>
+    <li>Windows 已安装 PowerShell 7；一键入口不会降级使用 Windows PowerShell 5.1。</li>
+    <li>当前 EXE 已通过版本、功能和 OCR 验收。</li>
+    <li>publisher 令牌保存在密码管理器中，没有出现在脚本或聊天记录里。</li>
+  </ul>
+
+  <h2>执行发布</h2>
+
+  <div class="step">
+    <div class="step-number">1</div>
+    <div class="step-body">
+      <h3>复制 publisher 令牌</h3>
+      <p>只复制令牌本身，不要把它粘贴到脚本、文件名或聊天窗口。发布脚本读取后会立即清空剪贴板。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">2</div>
+    <div class="step-body">
+      <h3>双击一键发布入口</h3>
+      <p>运行项目根目录的：</p>
+      <pre>一键发布到群晖.bat</pre>
+      <p>脚本自动读取 <code>con.py</code> 的版本号，寻找同版本最新验收报告，并重新计算 EXE 的大小和 SHA-256。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">3</div>
+    <div class="step-body">
+      <h3>核对并确认</h3>
+      <p>屏幕会显示版本、验收报告、来源 EXE、大小、SHA-256、群晖目录和下载地址。全部正确后输入：</p>
+      <pre>PUBLISH</pre>
+      <p>其他输入会安全取消，不会写入群晖。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-number">4</div>
+    <div class="step-body">
+      <h3>等待五项完成</h3>
+      <pre>[1/5] 上传并核对不可变版本文件
+[2/5] 准备稳定下载首页和健康文件
+[3/5] 从 HTTP 完整下载并复核大小、SHA-256
+[4/5] 原子提交 latest.json 发布指针
+[5/5] 推送 release.ready 通知</pre>
+      <p><code>latest.json</code> 是最后提交的发布指针。版本化 EXE 经 HTTP 完整下载并重新核对哈希后，才会更新该指针并推送通知，避免同事收到指向半成品的消息。</p>
+    </div>
+  </div>
+
+  <h2>发布后得到什么</h2>
+  <table>
+    <thead><tr><th>产物</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>PhotoCollect-v5.15.2.exe</code></td><td>不可变的版本化完整安装文件</td></tr>
+      <tr><td><code>PhotoCollect-v5.15.2.json</code></td><td>该版本的固定清单</td></tr>
+      <tr><td><code>latest.json</code></td><td>当前作为下载页的数据源；未来也供客户端检查最新版</td></tr>
+      <tr><td><code>index.html</code></td><td>稳定下载页，运行时读取 latest.json 展示最新版本</td></tr>
+      <tr><td><code>health.txt</code></td><td>静态文件服务健康检查</td></tr>
+    </tbody>
+  </table>
+
+  <h2>验收</h2>
+  <div class="progress"><span data-progress-bar></span></div>
+  <p class="progress-label" data-progress-label></p>
+  <div class="checklist" data-checklist data-storage-key="photocollect-publish-lesson-0002">
+    <label class="check-item"><input type="checkbox">脚本识别的版本与准备发布的版本一致</label>
+    <label class="check-item"><input type="checkbox">五个发布阶段均完成，没有红色错误</label>
+    <label class="check-item"><input type="checkbox">打开下载页能看到正确版本和 SHA-256</label>
+    <label class="check-item"><input type="checkbox">另一台局域网电脑能够下载版本化 EXE</label>
+    <label class="check-item"><input type="checkbox">client 订阅端收到 release.ready 通知</label>
+  </div>
+  <div class="callout good" data-complete-message hidden>
+    完整版本发布链路已经掌握。下一阶段可以接入客户端自动检查、下载校验和安全替换。
+  </div>
+
+  <h2>可信依据</h2>
+  <ul>
+    <li><a href="https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash">Microsoft：Get-FileHash</a>，用于核对文件完整性。</li>
+    <li><a href="https://docs.ntfy.sh/publish/">ntfy：Sending messages</a>，用于发布带认证的更新通知。</li>
+  </ul>
+
+  <p>哪里看不懂或出现错误，直接把不含令牌的输出发给 Codex，不要猜着继续。</p>
+
+  <div class="next">
+    <a class="button" href="0001-synology-update-center.html">返回部署课</a>
+    <a class="button secondary" href="../reference/synology-update-center-cheatsheet.html">打开速查表</a>
+  </div>
+</main>
+<script src="../assets/checklist.js"></script>
+</body>
+</html>
