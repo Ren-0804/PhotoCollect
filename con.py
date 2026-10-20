@@ -68,7 +68,6 @@ from ocr_services import (
     build_container_candidates,
     classify_task_state,
     extract_declared_container_no,
-    generate_text_sequences,
     important_ocr_complete,
     iso6346_check_digit,
     merge_important_ocr_results,
@@ -80,6 +79,7 @@ from ocr_services import (
     parse_size_type,
     parse_weight_value,
     parse_weights,
+    read_boxed_check_digit,
     validate_container_no,
 )
 from updater_services import (
@@ -476,9 +476,20 @@ def run_ocr_image(image_path: str) -> dict:
     t0 = time.time()
     engine = ensure_ocr_engine()
     with _ocr_inference_lock:
-        raw_result, _ = engine(image_path)
-    elapsed_ms = int((time.time() - t0) * 1000)
-    return parse_container_ocr(raw_result, elapsed_ms=elapsed_ms)
+        # Load once so the framed check digit can be re-read from the same pixels.
+        image = engine.load_img(image_path)
+        raw_result, _ = engine(image)
+
+        def read_check_digit(serial_bounds):
+            try:
+                return read_boxed_check_digit(engine, image, serial_bounds)
+            except Exception:
+                log.exception("Check-digit re-read failed")
+                return None
+
+        result = parse_container_ocr(raw_result, check_digit_reader=read_check_digit)
+    result["elapsed_ms"] = int((time.time() - t0) * 1000)
+    return result
 
 
 def run_ocr_smoke_cli(argv) -> int:

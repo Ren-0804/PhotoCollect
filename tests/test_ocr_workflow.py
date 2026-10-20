@@ -222,6 +222,31 @@ class OcrVerificationTests(unittest.TestCase):
         self.assertEqual(compressed_result["container_no"], "LYGU3043781")
         self.assertEqual(compressed_result["size_type"], "22G1")
 
+    def test_framed_check_digit_is_read_instead_of_inferred(self):
+        import cv2
+        import numpy as np
+
+        # The full-image pass drops a digit printed inside its frame, as on
+        # real doors; the targeted re-read must recover it.
+        image = np.full((300, 900, 3), (140, 60, 20), np.uint8)
+        font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 2.0, 5
+        cv2.putText(image, "CICU", (60, 140), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.putText(image, "410260", (300, 140), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        (width, height), _ = cv2.getTextSize("410260", font, scale, thickness)
+        frame_x = 300 + width + 20
+        cv2.rectangle(image, (frame_x, 140 - height - 12), (frame_x + 52, 152), (255, 255, 255), 3)
+        cv2.putText(image, "3", (frame_x + 6, 140), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.putText(image, "25G1", (300, 230), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        with qt_temporary_directory() as tmp:
+            path = Path(tmp) / "framed-check-digit.png"
+            path.write_bytes(cv2.imencode(".png", image)[1].tobytes())
+            result = con.run_ocr_image(str(path))
+
+        self.assertEqual(result["container_no"], "CICU4102603")
+        self.assertFalse(result["inferred_check_digit"])
+        self.assertEqual(result["size_type"], "25G1")
+
 
 class AutoOcrUploadTests(unittest.TestCase):
     @classmethod
