@@ -673,6 +673,12 @@ class AutoOcrUploadTests(unittest.TestCase):
                 self.actions.append(action)
                 return action
 
+            def addMenu(self, _title):
+                return type(self)()
+
+            def setIcon(self, _icon):
+                pass
+
             def addSeparator(self):
                 pass
 
@@ -740,9 +746,11 @@ class AutoOcrUploadTests(unittest.TestCase):
             self.assertEqual(notices[-1][1], "移到这里")
             self.assertIsNotNone(notices[-1][2])
             notices[-1][2]()
+            # The move renames the photo, so its name never contradicts its slot.
+            self.assertEqual(original_name, "LYGU3043781-3.jpg")
             self.assertEqual(window.meta["3"], [])
-            self.assertEqual(window.meta["8"], [original_name])
-            self.assertEqual(len(list(window.box_dir.glob("*.jpg"))), 1)
+            self.assertEqual(window.meta["8"], ["LYGU3043781-8.jpg"])
+            self.assertEqual([path.name for path in window.box_dir.glob("*.jpg")], ["LYGU3043781-8.jpg"])
             window.close()
 
 

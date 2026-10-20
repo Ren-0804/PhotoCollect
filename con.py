@@ -38,6 +38,7 @@ from report_services import (
 from task_services import (
     ExportPreflight,
     TaskSnapshot,
+    _infer_app_named_category,
     build_export_preflight,
     resolve_task_photos,
 )
@@ -3949,32 +3950,192 @@ class BoxDetailWindow(QWidget):
             lambda: self._move_image_to_category(filename, source_idx, target_idx),
         )
 
-    def _move_image_to_category(self, filename: str, source_idx: int, target_idx: int):
-        source_key = str(source_idx)
-        target_key = str(target_idx)
-        source_files = self.meta.setdefault(source_key, [])
-        target_files = self.meta.setdefault(target_key, [])
-        if filename not in source_files:
+    def _move_image_to_category(self, filename: str, source_idx: int, target_idx: int,
+                                restore_name: str = "", undo_state=None):
+        """Move one photo to another slot and rename it to that slot's next free name.
+
+        Only PhotoCollect names (<box>-<N>[_k].ext) are renamed, because disk
+        recovery and the training tool read the category from them. The file is
+        renamed first and renamed back if meta cannot be saved. `restore_name`
+        and `undo_state` are set when this call undoes an earlier move.
+        """
+        undoing = undo_state is not None
+        verb = "撤销" if undoing else "移动"
+
+        def try_later(text):
+            if undoing:
+                self._notify(text, "撤销", lambda: self._move_image_to_category(
+                    filename, source_idx, target_idx, restore_name, undo_state))
+            else:
+                self._notify(text)
+
+        if self._page_disposed or source_idx == target_idx:
+            return False
+        source_key, target_key = str(source_idx), str(target_idx)
+        if filename not in self.meta.get(source_key, []):
             self.reload_from_disk()
-            self._notify("照片位置已经变化，请重新粘贴")
-            return
+            self._notify(f"照片位置已经变化，没有{verb}")
+            return False
+        if self._image_import_task is not None or self._image_import_queue:
+            try_later(f"照片还在保存，请稍后再{verb}")
+            return False
+        ocr_task = self._ocr_task
+        if ocr_task is not None and Path(getattr(ocr_task, "image_path", "")).name == filename:
+            try_later(f"这张照片正在识别，请稍后再{verb}")
+            return False
 
-        source_before = list(source_files)
-        target_before = list(target_files)
-        source_files[:] = [name for name in source_files if name != filename]
-        if filename not in target_files:
-            target_files.append(filename)
-        if not self.save_meta():
-            self.meta[source_key] = source_before
-            self.meta[target_key] = target_before
-            return
+        old_path = self.box_dir / filename
+        name_category = _infer_app_named_category(self.box_name, filename, len(ALL_CATEGORIES))
+        try:
+            before = old_path.stat()
+            new_name = filename
+            if name_category is not None and name_category != target_idx:
+                new_name = self._rename_into_category(old_path, target_idx, restore_name)
+        except OSError as exc:
+            log.warning("Moving photo %s failed: %s", filename, exc)
+            self.reload_from_disk()
+            show_operation_error(
+                self,
+                "照片移动失败",
+                "照片和分类记录保持原状。照片可能正被其他程序打开，关闭后再试。",
+                str(exc),
+            )
+            return False
+        new_path = self.box_dir / new_name
+        try:
+            after = new_path.stat()
+        except OSError:
+            after = None
 
+        meta_before = {key: list(self.meta.get(key, [])) for key in (source_key, target_key)}
+        ocr_before = json.loads(json.dumps(self.ocr_result))
+        self.meta[source_key] = [name for name in meta_before[source_key] if name != filename]
+        self.meta[target_key] = list(meta_before[target_key])
+        if new_name not in self.meta[target_key]:
+            self.meta[target_key].append(new_name)
+        restored = (undoing and new_name == restore_name
+                    and self.ocr_result == undo_state["ocr_after"])
+        recheck = None
+        if restored:
+            # Nothing has touched OCR since the move, so its evidence is valid again.
+            self.ocr_result = undo_state["ocr_before"]
+        else:
+            recheck = self._update_ocr_for_move(filename, new_name, source_idx, target_idx, before, after)
+        if not self.save_meta(show_error=False):
+            self.meta.update(meta_before)
+            self.ocr_result = ocr_before
+            try:
+                if new_name != filename:
+                    os.rename(new_path, old_path)
+            except OSError as exc:
+                log.exception("Unable to restore the name of %s", filename)
+                self.reload_from_disk()
+                show_operation_error(
+                    self,
+                    "照片移动失败",
+                    f"分类记录没有保存，照片也没能改回原名，现在叫 {new_name}。"
+                    f"重新打开任务后，它会按文件名显示在“{self._category_label(target_idx)}”。"
+                    "请检查工作目录是否可写。",
+                    str(exc),
+                )
+                return False
+            show_operation_error(
+                self,
+                "照片移动失败",
+                "分类记录没有保存，照片保持原名留在原分类。请检查工作目录是否可写。",
+                str(self.meta_path),
+            )
+            return False
+
+        if self._image_hash_index is not None:
+            for digest, indexed_name in list(self._image_hash_index.items()):
+                if indexed_name == filename:
+                    self._image_hash_index[digest] = new_name
         self.refresh_card(source_idx)
         self.refresh_card(target_idx)
         self.select_category(target_idx)
         self.refresh_header_state()
-        self.maybe_auto_ocr(target_idx, [filename])
-        self._notify(f"照片已移到“{self._category_label(target_idx)}”")
+        if recheck is not None:
+            self.maybe_auto_ocr(recheck[0], [recheck[1]], force=True)
+        if not restored and target_idx in AUTO_OCR_CATEGORIES:
+            self.maybe_auto_ocr(target_idx, [new_name])
+        label = self._category_label(target_idx)
+        if undoing:
+            self._notify(f"已撤销，照片回到“{label}”")
+            return True
+        ocr_after = json.loads(json.dumps(self.ocr_result))
+        renamed = f"，改名为 {new_name}" if new_name != filename else ""
+        self._notify(
+            f"照片已移到“{label}”{renamed}",
+            "撤销",
+            lambda: self._move_image_to_category(
+                new_name, target_idx, source_idx, filename,
+                {"ocr_before": ocr_before, "ocr_after": ocr_after},
+            ),
+        )
+        return True
+
+    def _rename_into_category(self, path: Path, idx: int, preferred_name: str = "") -> str:
+        """Rename a photo to slot `idx`'s next free name, or to `preferred_name` while it is free."""
+        for _attempt in range(20):
+            if preferred_name and not (self.box_dir / preferred_name).exists():
+                name, destination = preferred_name, self.box_dir / preferred_name
+            else:
+                name, destination = self._next_image_path(idx, path.suffix.lower())
+            try:
+                # On Windows os.rename never replaces an existing file, so a
+                # name taken a moment ago just moves on to the next one.
+                os.rename(path, destination)
+                return name
+            except FileExistsError:
+                preferred_name = ""
+        raise FileExistsError(f"No free photo name in category {idx}")
+
+    def _update_ocr_for_move(self, old_name, new_name, source_idx, target_idx, before, after):
+        """Keep OCR evidence tied to door photos (slots 4/5) after a move.
+
+        Returns (category, name) of a door photo to recognize again, or None.
+        """
+        result = self.ocr_result or {}
+        listed = result.get('source_images')
+        sources = set(listed if isinstance(listed, list) else [])
+        sources.update((result.get('source_image'), result.get('pending_source')))
+        was_door = source_idx in AUTO_OCR_CATEGORIES
+        is_door = target_idx in AUTO_OCR_CATEGORIES
+        if old_name in sources and was_door and not is_door:
+            # The result came from a photo that is no longer a door photo.
+            for idx in (5, 4):
+                names = self.meta.get(str(idx), [])
+                if names:
+                    self.ocr_result = {'pending_source': names[-1], 'verification_status': 'unreadable'}
+                    return idx, names[-1]
+            self.ocr_result = {}
+        elif old_name in sources and new_name != old_name:
+            self.ocr_result = self._renamed_ocr_result(result, old_name, new_name, before, after)
+        elif is_door and not was_door:
+            # Same as adding a door photo: it becomes the evidence to check.
+            self.ocr_result = {'pending_source': new_name, 'verification_status': 'unreadable'}
+        return None
+
+    @staticmethod
+    def _renamed_ocr_result(result, old_name, new_name, before, after):
+        renamed = json.loads(json.dumps(result))
+        for key in ('source_image', 'pending_source'):
+            if renamed.get(key) == old_name:
+                renamed[key] = new_name
+        if isinstance(renamed.get('source_images'), list):
+            renamed['source_images'] = [new_name if name == old_name else name for name in renamed['source_images']]
+        for key in ('source_sha256', 'source_signatures'):
+            values = renamed.get(key)
+            if isinstance(values, dict) and old_name in values:
+                values[new_name] = values.pop(old_name)
+        signatures = renamed.get('source_signatures')
+        signature = signatures.get(new_name) if isinstance(signatures, dict) else None
+        if after is not None and signature and list(signature) == [before.st_size, before.st_mtime_ns, before.st_ctime_ns]:
+            # A rename keeps the content; carry a still-valid signature over even
+            # where the file system updates a timestamp on rename.
+            signatures[new_name] = [after.st_size, after.st_mtime_ns, after.st_ctime_ns]
+        return renamed
 
     def _rollback_added_files(self, idx, filenames):
         files = self.meta.setdefault(str(idx), [])
@@ -4950,6 +5111,15 @@ class BoxDetailWindow(QWidget):
         act_ocr.setIcon(app_icon(self, "search"))
         act_replace = m.addAction("替换图片")
         act_replace.setIcon(app_icon(self, "replace"))
+        move_menu = m.addMenu("移到其他分类")
+        move_menu.setIcon(app_icon(self, "sort"))
+        move_menu.setStyleSheet(MENU_STYLESHEET)
+        move_targets = {}
+        for target_idx, label in ALL_CATEGORIES:
+            if target_idx == idx:
+                continue
+            count = len(self.meta.get(str(target_idx), []))
+            move_targets[move_menu.addAction(f"{label}（已有 {count} 张）" if count else label)] = target_idx
         m.addSeparator()
         act_del = m.addAction("删除图片")
         act_del.setIcon(app_icon(self, "delete", Theme.ERROR))
@@ -4960,6 +5130,8 @@ class BoxDetailWindow(QWidget):
             self.preview(it, w, idx)
         elif chosen == act_ocr:
             self.run_ocr_for_image(fn)
+        elif chosen in move_targets:
+            self._move_image_to_category(fn, idx, move_targets[chosen])
         elif chosen == act_replace:
             fs, _ = QFileDialog.getOpenFileNames(self, "选择替换图片", filter="Images (*.png *.jpg *.jpeg *.bmp)")
             if fs:
