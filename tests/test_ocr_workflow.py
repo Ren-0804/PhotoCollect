@@ -1341,6 +1341,8 @@ class DashboardWorkflowTests(unittest.TestCase):
                 detail.btn_next_missing,
                 detail.btn_ocr,
                 detail.btn_more,
+                # The auto-sort button is only focusable when the git-ignored model is installed.
+                *([detail.auto_sort_zone.btn_choose] if detail.auto_sort_zone.btn_choose.isEnabled() else []),
                 detail.cards[1],
                 detail.cards[1].btn_add,
                 detail.cards[1].lw,

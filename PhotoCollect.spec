@@ -15,6 +15,19 @@ rapidocr_datas = [
     (str(rapidocr_root / 'ch_ppocr_v3_rec'), 'rapidocr_onnxruntime/ch_ppocr_v3_rec'),
 ]
 
+# The photo-slot classifier is trained from customer photos, so it stays out of
+# the public repository (models/ is git-ignored). Refuse to build without it.
+photo_classifier_files = [
+    Path(SPECPATH) / 'models' / 'photo_classifier.onnx',
+    Path(SPECPATH) / 'models' / 'photo_classifier.json',
+]
+missing_photo_classifier = [str(path) for path in photo_classifier_files if not path.is_file()]
+if missing_photo_classifier:
+    raise SystemExit(
+        'Photo classifier model missing (train it with tools/train_photo_classifier.py): '
+        + ', '.join(missing_photo_classifier)
+    )
+
 a = Analysis(
     ['con.py'],
     pathex=[],
@@ -24,6 +37,7 @@ a = Analysis(
         ('assets\\app-logo.ico', 'assets'),
         ('tests\\fixtures\\container_sample.jpg', 'tests\\fixtures'),
         *rapidocr_datas,
+        *[(str(path), 'models') for path in photo_classifier_files],
     ],
     hiddenimports=[*rapidocr_hiddenimports, 'numpy._core._exceptions'],
     hookspath=[],

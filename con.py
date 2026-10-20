@@ -8,13 +8,14 @@ import sys
 import time
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
 from PySide6.QtCore import Qt, QSize, Signal, QPoint, QRect, QEvent, QRunnable, QThreadPool, QObject, QTimer, QBuffer, QIODevice, QByteArray, QUrl
-from PySide6.QtGui import QIcon, QColor, QBrush, QPainter, QPen, QImage, QPixmap, QKeySequence, QShortcut, QDesktopServices, QPalette, QCursor, QFontMetrics
+from PySide6.QtGui import QIcon, QColor, QBrush, QPainter, QPen, QImage, QImageReader, QPixmap, QKeySequence, QShortcut, QDesktopServices, QPalette, QCursor, QFontMetrics
 from PySide6.QtWidgets import *
 
 from storage_services import (
@@ -50,6 +51,12 @@ from image_import_services import (
 from export_naming import (
     DEFAULT_EXPORT_TEMPLATES,
     render_export_filename,
+)
+from photo_classifier import (
+    MANUAL as AUTO_SORT_MANUAL,
+    PLACE as AUTO_SORT_PLACE,
+    PhotoClassifier,
+    placement_for,
 )
 from theme_services import (
     DEFAULT_THEME_NAME,
@@ -179,6 +186,23 @@ _ocr_inference_lock = threading.Lock()
 def resource_path(relative_path: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / relative_path
+
+
+_photo_classifier = None
+_photo_classifier_loaded = False
+
+
+def get_photo_classifier():
+    """The bundled slot classifier, or None when models/photo_classifier.onnx is absent."""
+    global _photo_classifier, _photo_classifier_loaded
+    if not _photo_classifier_loaded:
+        try:
+            _photo_classifier = PhotoClassifier.from_directory(resource_path("models"))
+        except Exception:
+            log.exception("Unable to load the photo classifier")
+            _photo_classifier = None
+        _photo_classifier_loaded = True
+    return _photo_classifier
 
 
 def qimage_jpeg_bytes(image: QImage, quality: int = CLIPBOARD_JPEG_QUALITY) -> bytes:
@@ -341,6 +365,34 @@ def extract_windows_virtual_images(mime) -> list:
         if ext in IMAGE_EXTENSIONS or QImage.fromData(payload).isNull() is False:
             images.append((name, payload))
     return images
+
+
+def accepts_image_drag(mime) -> bool:
+    return bool(
+        mime.hasUrls()
+        or mime.hasImage()
+        or _windows_mime_format(mime, "FileGroupDescriptorW")
+        or _windows_mime_format(mime, "FileGroupDescriptor")
+    )
+
+
+def read_image_drop(mime):
+    """Classify a drop as ("files", paths), ("virtual", [(name, bytes)]), ("image", data),
+    ("bad_files", None) for non-image files, or ("unsupported", None)."""
+    files = [
+        url.toLocalFile() for url in mime.urls()
+        if os.path.isfile(url.toLocalFile()) and Path(url.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    if files:
+        return "files", files
+    virtual_images = extract_windows_virtual_images(mime)
+    if virtual_images:
+        return "virtual", virtual_images
+    if mime.hasImage():
+        return "image", mime.imageData()
+    if mime.hasUrls():
+        return "bad_files", None
+    return "unsupported", None
 
 
 def build_task_summary(box_dir: Path, box_meta: dict, global_reqs, require_ocr: bool = True) -> dict:
@@ -973,6 +1025,93 @@ class ImageImportTask(QRunnable):
             self.signals.finished.emit(summary)
         except Exception as exc:
             log.exception("Background image import failed")
+            self.signals.error.emit(str(exc))
+
+
+@dataclass(frozen=True)
+class AutoSortItem:
+    source: tuple
+    prediction: object = None
+    duplicate_of: str = ""
+    error: str = ""
+
+    @property
+    def label(self) -> str:
+        return str(self.source[1])
+
+
+def _predict_first_readable(classifier, samples):
+    error = None
+    for sample in samples:
+        try:
+            return classifier.predict(sample)
+        except Exception as exc:
+            error = exc
+    raise error
+
+
+def classify_import_sources(classifier, box_dir, box_meta, sources) -> list:
+    """Predict a slot for each drop source (same tuples as ImageImportTask).
+
+    Photos already saved in the task are reported as duplicates instead of being
+    classified.  Payload and QImage sources are hashed as the JPEG the importer
+    would save; payloads are classified from their original bytes so EXIF
+    orientation is honoured.
+    """
+    hash_index = build_image_hash_index(box_dir, box_meta)
+    items = []
+    for source in sources:
+        kind = source[0]
+        try:
+            if kind == "path":
+                digest = file_sha256(source[2])
+                samples = (source[2],)
+            elif kind in ("payload", "qimage"):
+                raw = bytes(source[2]) if kind == "payload" else b""
+                image = QImage.fromData(raw) if kind == "payload" else QImage(source[2])
+                compact = qimage_jpeg_bytes(image) if not image.isNull() else b""
+                if not compact:
+                    raise ValueError("无法解码图片")
+                digest = bytes_sha256(compact)
+                samples = (raw, compact) if raw else (compact,)
+            else:
+                raise ValueError("不支持的图片来源")
+            duplicate = hash_index.get(digest, "")
+            if duplicate:
+                items.append(AutoSortItem(source, duplicate_of=duplicate))
+                continue
+            hash_index[digest] = str(source[1])
+            items.append(AutoSortItem(source, prediction=_predict_first_readable(classifier, samples)))
+        except Exception as exc:
+            log.warning("Auto sort could not read %s: %s", source[1], exc)
+            items.append(AutoSortItem(source, error=str(exc)))
+    return items
+
+
+class PhotoClassifySignals(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+
+class PhotoClassifyTask(QRunnable):
+    """Run the slot classifier for one drop outside the UI thread."""
+
+    def __init__(self, classifier, box_dir: Path, box_meta: dict, sources: list):
+        super().__init__()
+        self.classifier = classifier
+        self.box_dir = Path(box_dir)
+        self.box_meta = json.loads(json.dumps(box_meta))
+        self.sources = list(sources)
+        self.signals = PhotoClassifySignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            self.signals.finished.emit(
+                classify_import_sources(self.classifier, self.box_dir, self.box_meta, self.sources)
+            )
+        except Exception as exc:
+            log.exception("Photo classification failed")
             self.signals.error.emit(str(exc))
 
 
@@ -2204,8 +2343,7 @@ class DropZoneCard(QFrame):
         self.setMinimumHeight(card_min_h)
 
     def dragEnterEvent(self, e):
-        mime = e.mimeData()
-        if mime.hasUrls() or mime.hasImage() or _windows_mime_format(mime, "FileGroupDescriptorW") or _windows_mime_format(mime, "FileGroupDescriptor"):
+        if accepts_image_drag(e.mimeData()):
             e.acceptProposedAction()
             self.setStyleSheet(self._drag_style())
             self._visual_state_key = None
@@ -2239,18 +2377,14 @@ class DropZoneCard(QFrame):
         self.set_state(self.state)
         self.selected.emit(self.idx)
         mime = e.mimeData()
-        files = [
-            u.toLocalFile() for u in e.mimeData().urls()
-            if os.path.isfile(u.toLocalFile()) and Path(u.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS
-        ]
-        virtual_images = extract_windows_virtual_images(mime)
-        if files:
-            self.files_dropped.emit(self.idx, files)
-        elif virtual_images:
-            self.virtual_files_dropped.emit(self.idx, virtual_images)
-        elif mime.hasImage():
-            self.image_dropped.emit(self.idx, mime.imageData())
-        elif e.mimeData().hasUrls():
+        kind, data = read_image_drop(mime)
+        if kind == "files":
+            self.files_dropped.emit(self.idx, data)
+        elif kind == "virtual":
+            self.virtual_files_dropped.emit(self.idx, data)
+        elif kind == "image":
+            self.image_dropped.emit(self.idx, data)
+        elif kind == "bad_files":
             QMessageBox.warning(self, "提示", "请拖入 PNG、JPG、JPEG 或 BMP 图片")
         else:
             log.info("Unsupported drop formats: %s", ", ".join(mime.formats()))
@@ -2262,6 +2396,169 @@ class DropZoneCard(QFrame):
         fs, _ = QFileDialog.getOpenFileNames(self, "选图", filter="Images (*.png *.jpg *.jpeg *.bmp)")
         if fs:
             self.files_dropped.emit(self.idx, fs)
+
+
+class AutoSortDropZone(QFrame):
+    """Drop target above the slot cards; the photo classifier picks slots 1-5."""
+
+    files_dropped = Signal(list)
+    image_dropped = Signal(object)
+    virtual_files_dropped = Signal(list)
+
+    IDLE_HINT = "自动放进 1-5 类；拿不准的会让你选，6-8 类请直接拖到下面的方框"
+    MISSING_HINT = "缺少自动分类模型文件，请把照片拖到下面对应的方框"
+
+    def __init__(self, available: bool, parent=None):
+        super().__init__(parent)
+        self.setObjectName("AutoSortDropZone")
+        self.available = bool(available)
+        self.setAcceptDrops(self.available)
+        self.setFixedHeight(64)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 8, 10, 8)
+        layout.setSpacing(10)
+        icon = QLabel()
+        icon.setFixedSize(26, 26)
+        icon.setStyleSheet("background:transparent; border:none;")
+        icon.setPixmap(app_icon(self, "image", Theme.PRIMARY if self.available else Theme.TEXT_MUTED).pixmap(22, 22))
+        layout.addWidget(icon)
+
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        self.lbl_title = QLabel("拖到这里自动分类" if self.available else "自动分类不可用")
+        self.lbl_title.setStyleSheet(
+            f"font-size:13px; font-weight:800; color:{Theme.TEXT_MAIN}; background:transparent; border:none;"
+        )
+        text.addWidget(self.lbl_title)
+        self.lbl_hint = QLabel()
+        self.lbl_hint.setStyleSheet(f"font-size:12px; color:{Theme.TEXT_SEC}; background:transparent; border:none;")
+        text.addWidget(self.lbl_hint)
+        layout.addLayout(text, 1)
+
+        self.btn_choose = QPushButton("选择图片")
+        style_button(self.btn_choose, icon_name="add")
+        self.btn_choose.setFixedHeight(32)
+        self.btn_choose.clicked.connect(self.choose_files)
+        layout.addWidget(self.btn_choose)
+
+        self.set_busy("")
+        self._apply_style(dragging=False)
+
+    def _apply_style(self, dragging: bool) -> None:
+        if not self.available:
+            border, bg, width = Theme.BORDER, Theme.BG_SUBTLE, 1
+        elif dragging:
+            border, bg, width = Theme.PRIMARY, Theme.PRIMARY_SOFT, 2
+        else:
+            border, bg, width = Theme.PRIMARY, Theme.BG_CARD, 1
+        self.setStyleSheet(f"""
+            AutoSortDropZone {{
+                background-color: {bg};
+                border: {width}px dashed {border};
+                border-radius: 8px;
+            }}
+        """)
+
+    def set_busy(self, text: str) -> None:
+        self.lbl_hint.setText(text or (self.IDLE_HINT if self.available else self.MISSING_HINT))
+        self.btn_choose.setEnabled(self.available and not text)
+
+    def dragEnterEvent(self, e):
+        if self.available and accepts_image_drag(e.mimeData()):
+            e.acceptProposedAction()
+            self._apply_style(dragging=True)
+
+    def dragLeaveEvent(self, e):
+        self._apply_style(dragging=False)
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        self._apply_style(dragging=False)
+        mime = e.mimeData()
+        kind, data = read_image_drop(mime)
+        if kind == "files":
+            self.files_dropped.emit(data)
+        elif kind == "virtual":
+            self.virtual_files_dropped.emit(data)
+        elif kind == "image":
+            self.image_dropped.emit(data)
+        elif kind == "bad_files":
+            QMessageBox.warning(self, "提示", "请拖入 PNG、JPG、JPEG 或 BMP 图片")
+        else:
+            log.info("Unsupported drop formats: %s", ", ".join(mime.formats()))
+            QMessageBox.information(self, "无法直接拖入", "当前拖拽来源没有提供图片数据。可以在 Telegram 里复制图片，点击一个分类方框后按 Ctrl+V。")
+        e.acceptProposedAction()
+
+    def choose_files(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "选择要自动分类的图片", filter="Images (*.png *.jpg *.jpeg *.bmp)")
+        if fs:
+            self.files_dropped.emit(fs)
+
+
+def category_label(idx: int) -> str:
+    return next((name for category_idx, name in ALL_CATEGORIES if category_idx == idx), str(idx))
+
+
+class AutoSortChoiceDialog(QDialog):
+    """Ask which slot an uncertain photo belongs to; chosen_category stays None when skipped."""
+
+    def __init__(self, preview: QImage, label: str, prediction, parent=None):
+        super().__init__(parent)
+        self.chosen_category = None
+        self.setWindowTitle("选择照片分类")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        heading = QLabel("没把握判断这张照片是哪一类，请选一个方框")
+        heading.setStyleSheet(f"font-size:15px; font-weight:800; color:{Theme.TEXT_MAIN};")
+        layout.addWidget(heading)
+        name = QLabel(str(label))
+        name.setStyleSheet(f"font-size:12px; color:{Theme.TEXT_SEC};")
+        layout.addWidget(name)
+
+        picture = QLabel()
+        picture.setAlignment(Qt.AlignCenter)
+        picture.setMinimumHeight(200)
+        if preview is not None and not preview.isNull():
+            picture.setPixmap(QPixmap.fromImage(preview).scaled(440, 330, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            picture.setText("无法预览这张图片")
+        layout.addWidget(picture, 1)
+
+        probabilities = dict(prediction.ranking)
+        self.candidate_buttons = {}
+        candidates_row = QHBoxLayout()
+        for position, category in enumerate(prediction.candidates(3)):
+            button = QPushButton(f"{category_label(category)}  {probabilities.get(category, 0.0):.0%}")
+            style_button(button, "Primary" if position == 0 else "Secondary")
+            button.clicked.connect(lambda _checked=False, c=category: self.choose(c))
+            candidates_row.addWidget(button)
+            self.candidate_buttons[category] = button
+        layout.addLayout(candidates_row)
+
+        other_row = QHBoxLayout()
+        other_row.addWidget(QLabel("其他方框"))
+        self.combo_other = QComboBox()
+        for idx, category_name in ALL_CATEGORIES:
+            self.combo_other.addItem(category_name, idx)
+        other_row.addWidget(self.combo_other, 1)
+        put = QPushButton("放入")
+        style_button(put)
+        put.clicked.connect(lambda: self.choose(self.combo_other.currentData()))
+        other_row.addWidget(put)
+        other_row.addSpacing(12)
+        skip = QPushButton("跳过")
+        style_button(skip)
+        skip.clicked.connect(self.reject)
+        other_row.addWidget(skip)
+        layout.addLayout(other_row)
+
+    def choose(self, category) -> None:
+        self.chosen_category = int(category)
+        self.accept()
 
 
 class OperationErrorDialog(QDialog):
@@ -3465,6 +3762,9 @@ class BoxDetailWindow(QWidget):
         self._image_hash_index = None
         self._image_import_task = None
         self._image_import_queue = []
+        self._auto_sort_task = None
+        self._auto_sort_queue = []
+        self._pending_auto_sort_report = None
         self._page_disposed = False
 
         self._photo_retry_count = 0
@@ -3800,6 +4100,17 @@ class BoxDetailWindow(QWidget):
         self.ocr_banner.hide()
         layout.addWidget(self.ocr_banner)
 
+        auto_sort_row = QWidget()
+        set_solid_background(auto_sort_row, Theme.BG_MAIN)
+        self._auto_sort_row_layout = QHBoxLayout(auto_sort_row)
+        self._auto_sort_row_layout.setContentsMargins(16, 12, 16, 0)
+        self.auto_sort_zone = AutoSortDropZone(get_photo_classifier() is not None)
+        self.auto_sort_zone.files_dropped.connect(self.auto_sort_files)
+        self.auto_sort_zone.image_dropped.connect(self.auto_sort_image)
+        self.auto_sort_zone.virtual_files_dropped.connect(self.auto_sort_virtual_files)
+        self._auto_sort_row_layout.addWidget(self.auto_sort_zone)
+        layout.addWidget(auto_sort_row)
+
         # Use FlowLayout instead of QGridLayout
         self.main_widget = SolidColorViewport(Theme.BG_MAIN)
         self.main_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -3854,7 +4165,8 @@ class BoxDetailWindow(QWidget):
         self.setTabOrder(self.btn_back, self.btn_next_missing)
         self.setTabOrder(self.btn_next_missing, self.btn_ocr)
         self.setTabOrder(self.btn_ocr, self.btn_more)
-        previous = self.btn_more
+        self.setTabOrder(self.btn_more, self.auto_sort_zone.btn_choose)
+        previous = self.auto_sort_zone.btn_choose
         for idx in sorted(self.cards):
             card = self.cards[idx]
             self.setTabOrder(previous, card)
@@ -3965,6 +4277,7 @@ class BoxDetailWindow(QWidget):
         self.flow_layout._v_spacing = dyn_spacing
         dyn_margin = max(10, min(16, vw // 70))
         self.flow_layout.setContentsMargins(dyn_margin, dyn_margin, dyn_margin, dyn_margin)
+        self._auto_sort_row_layout.setContentsMargins(dyn_margin, 12, dyn_margin, 0)
         margin_total = dyn_margin * 2
         spacing = dyn_spacing
 
@@ -4098,6 +4411,7 @@ class BoxDetailWindow(QWidget):
             if summary.cancelled:
                 self._notify("后台保存已停止，已完成的照片仍安全保留")
         self._start_next_image_import()
+        self._flush_auto_sort_report()
 
     def _on_image_import_error(
         self,
@@ -4116,6 +4430,7 @@ class BoxDetailWindow(QWidget):
                 str(message),
             )
         self._start_next_image_import()
+        self._flush_auto_sort_report()
 
     def add_files(self, idx, files):
         if self._use_background_image_import():
@@ -4282,6 +4597,266 @@ class BoxDetailWindow(QWidget):
         if duplicate or failed:
             self._notify(f"未保存：重复 {duplicate}，失败 {failed}")
 
+    # ---------- Auto sort (drop zone above the cards) ----------
+    def auto_sort_files(self, files):
+        self._auto_sort([("path", Path(source).name, str(source)) for source in files])
+
+    def auto_sort_image(self, image_data):
+        image = self._coerce_qimage(image_data)
+        if image is None or image.isNull():
+            QMessageBox.warning(self, "无法添加图片", "拖入的数据不是可保存的图片")
+            return
+        self._auto_sort([("qimage", "拖入的图片", QImage(image))])
+
+    def auto_sort_virtual_files(self, files):
+        self._auto_sort([("payload", str(name), bytes(payload)) for name, payload in files])
+
+    def _auto_sort(self, sources):
+        classifier = get_photo_classifier()
+        if classifier is None:
+            self._notify("自动分类不可用，请把照片拖到对应的方框")
+            return
+        if not sources:
+            return
+        if not self._use_background_image_import():
+            self._apply_auto_sort(classifier, classify_import_sources(classifier, self.box_dir, self.meta, sources))
+            return
+        self._auto_sort_queue.append(list(sources))
+        self._start_next_auto_sort()
+
+    def _start_next_auto_sort(self):
+        if self._page_disposed or self._auto_sort_task is not None or not self._auto_sort_queue:
+            return
+        classifier = get_photo_classifier()
+        sources = self._auto_sort_queue.pop(0)
+        task = PhotoClassifyTask(classifier, self.box_dir, self.meta, sources)
+        self._auto_sort_task = task
+        task.signals.finished.connect(lambda items: self._on_auto_sort_classified(task, classifier, items))
+        task.signals.error.connect(lambda message: self._on_auto_sort_error(task, message))
+        self.auto_sort_zone.set_busy(f"正在判断 {len(sources)} 张照片…")
+        QThreadPool.globalInstance().start(task)
+
+    def _on_auto_sort_classified(self, task, classifier, items):
+        if self._auto_sort_task is task:
+            self._auto_sort_task = None
+        if self._page_disposed:
+            return
+        self.auto_sort_zone.set_busy("")
+        self._apply_auto_sort(classifier, items)
+        self._start_next_auto_sort()
+
+    def _on_auto_sort_error(self, task, message):
+        if self._auto_sort_task is task:
+            self._auto_sort_task = None
+        if self._page_disposed:
+            return
+        self.auto_sort_zone.set_busy("")
+        show_operation_error(self, "自动分类失败", "照片没有保存。可以把照片直接拖到对应的方框。", str(message))
+        self._start_next_auto_sort()
+
+    def _queued_import_counts(self) -> dict:
+        counts = {}
+        for category, batch in self._image_import_queue:
+            counts[category] = counts.get(category, 0) + len(batch)
+        task = self._image_import_task
+        if task is not None:
+            counts[task.category] = counts.get(task.category, 0) + len(task.sources)
+        return counts
+
+    def _apply_auto_sort(self, classifier, items):
+        """Turn predictions into slot imports, asking the user where the rules say so."""
+        placements = {}
+        replace = set()
+        queued = self._queued_import_counts()
+        manual = []
+        duplicates = []
+        skipped = failed = 0
+        for item in items:
+            if item.error:
+                failed += 1
+                continue
+            if item.duplicate_of:
+                duplicates.append(item.duplicate_of)
+                continue
+            decision = placement_for(item.prediction, classifier.threshold)
+            if decision == AUTO_SORT_MANUAL:
+                manual.append(item.label)
+                continue
+            target = item.prediction.category if decision == AUTO_SORT_PLACE else self._ask_auto_sort_category(item)
+            if target is None:
+                skipped += 1
+                continue
+            pending = placements.get(target, [])
+            existing = 0 if target in replace else len(self.meta.get(str(target), [])) + queued.get(target, 0)
+            if existing or pending:
+                choice = self._ask_occupied_slot(item, target, existing + len(pending))
+                if choice is None:
+                    skipped += 1
+                    continue
+                if choice == "replace":
+                    replace.add(target)
+                    skipped += len(pending)
+                    pending = []
+            placements[target] = pending + [item.source]
+
+        placed = {}
+        trashed = {}
+        for target, sources in sorted(placements.items()):
+            if not sources:
+                continue
+            if target in replace:
+                entries = self._trash_slot_photos(target)
+                if entries is None:
+                    skipped += len(sources)
+                    continue
+                trashed[target] = entries
+            self._import_sources(target, sources)
+            placed[target] = len(sources)
+        # Background saves post their own toasts; show the sorting summary last
+        # so the user sees which slot each photo went to.
+        if self._pending_auto_sort_report is not None:
+            self._report_auto_sort(*self._pending_auto_sort_report)
+        self._pending_auto_sort_report = (placed, manual, duplicates, skipped, failed, trashed)
+        self._flush_auto_sort_report()
+
+    def _flush_auto_sort_report(self):
+        if self._page_disposed or self._pending_auto_sort_report is None:
+            return
+        if self._image_import_task is not None or self._image_import_queue:
+            return
+        report, self._pending_auto_sort_report = self._pending_auto_sort_report, None
+        self._report_auto_sort(*report)
+
+    def _ask_auto_sort_category(self, item):
+        dialog = AutoSortChoiceDialog(self._auto_sort_preview(item.source), item.label, item.prediction, self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return dialog.chosen_category
+
+    def _ask_occupied_slot(self, item, target, count):
+        """Return "append", "replace" or None (skip) for a photo whose slot is taken."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("方框里已有照片")
+        box.setText(f"“{self._category_label(target)}”里已经有 {count} 张照片。")
+        box.setInformativeText(f"新照片：{item.label}\n替换时，旧照片会移到“最近删除”，可以恢复。")
+        append = box.addButton(f"追加为第 {count + 1} 张", QMessageBox.AcceptRole)
+        replace = box.addButton("替换旧照片", QMessageBox.DestructiveRole)
+        box.addButton("跳过", QMessageBox.RejectRole)
+        box.setDefaultButton(append)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is append:
+            return "append"
+        if clicked is replace:
+            return "replace"
+        return None
+
+    @staticmethod
+    def _auto_sort_preview(source) -> QImage:
+        kind, _label, data = source
+        if kind == "path":
+            reader = QImageReader(str(data))
+            reader.setAutoTransform(True)
+            return reader.read()
+        if kind == "payload":
+            return QImage.fromData(bytes(data))
+        return QImage(data)
+
+    def _trash_slot_photos(self, idx):
+        """Move every photo of a slot to the trash; None (and an error dialog) on failure."""
+        store = TrashStore(self.root_dir)
+        entries = []
+        try:
+            for filename in list(self.meta.get(str(idx), [])):
+                entries.append((store, store.trash_photo(self.box_name, str(idx), filename)))
+                self._forget_image_filename(filename)
+        except Exception as exc:
+            log.warning("Replacing photos of category %s failed: %s", idx, exc)
+            self.reload_from_disk(invalidate_hashes=False)
+            show_operation_error(
+                self,
+                "旧照片移除失败",
+                f"“{self._category_label(idx)}”的新照片没有保存；已经移走的旧照片可以在“最近删除”里恢复。",
+                str(exc),
+            )
+            return None
+        self.reload_from_disk(invalidate_hashes=False)
+        return entries
+
+    def _undo_replace(self, trashed):
+        """Swap back: the replacing photos go to the trash, the replaced ones return.
+
+        The new photo usually took the old file name, so the old one can only be
+        restored after the new one has been moved away.
+        """
+        if self._page_disposed:
+            return
+        queued = self._queued_import_counts()
+        if any(queued.get(target) for target in trashed):
+            self._notify("新照片还在保存，请稍后再撤销", "撤销替换", lambda: self._undo_replace(trashed))
+            return
+        failures = []
+        restored = {}
+        for target, entries in trashed.items():
+            for filename in list(self.meta.get(str(target), [])):
+                try:
+                    TrashStore(self.root_dir).trash_photo(self.box_name, str(target), filename)
+                    self._forget_image_filename(filename)
+                except Exception as exc:
+                    failures.append(str(exc))
+            for store, entry in entries:
+                try:
+                    store.restore(entry["id"])
+                    restored.setdefault(target, []).append(entry["filename"])
+                except Exception as exc:
+                    failures.append(str(exc))
+        self.reload_from_disk()
+        for target, names in restored.items():
+            self.maybe_auto_ocr(target, names, force=True)
+        if failures:
+            show_operation_error(self, "撤销替换失败", "没有恢复的照片仍在“最近删除”中。", "\n".join(failures))
+        else:
+            self._notify("已撤销替换，新照片移到了最近删除")
+
+    def _import_sources(self, idx, sources):
+        if self._use_background_image_import():
+            self._queue_image_import(idx, sources)
+            return
+        paths = [source[2] for source in sources if source[0] == "path"]
+        payloads = [(source[1], source[2]) for source in sources if source[0] == "payload"]
+        if paths:
+            self._add_files_sync(idx, paths)
+        if payloads:
+            self._add_virtual_files_sync(idx, payloads)
+        for source in sources:
+            if source[0] == "qimage":
+                self._add_image_data_sync(idx, source[2])
+
+    def _report_auto_sort(self, placed, manual, duplicates, skipped, failed, trashed):
+        parts = []
+        if placed:
+            parts.append("已自动放入 " + "，".join(
+                f"{self._category_label(idx)} {count} 张" for idx, count in sorted(placed.items())
+            ))
+        if manual:
+            parts.append(f"{len(manual)} 张像 6-8 类（加固/底梁、铅封/其他），请手动拖到对应方框")
+        if len(duplicates) == 1 and self._find_image_category(duplicates[0]) is not None:
+            parts.append(f"这张照片已在“{self._category_label(self._find_image_category(duplicates[0]))}”，未重复保存")
+        elif duplicates:
+            parts.append(f"{len(duplicates)} 张已在本箱，未重复保存")
+        if skipped:
+            parts.append(f"跳过 {skipped} 张")
+        if failed:
+            parts.append(f"{failed} 张无法读取")
+        if not parts:
+            return
+        text = "；".join(parts)
+        if trashed:
+            self._notify(text + "；旧照片已移到最近删除", "撤销替换", lambda: self._undo_replace(trashed))
+        else:
+            self._notify(text)
+
     def log_telegram_drop(self, idx, dst_name):
         log.info("Saved dropped image to category %s as %s", idx, dst_name)
 
@@ -4350,6 +4925,7 @@ class BoxDetailWindow(QWidget):
         self._photo_retry_timer.stop()
         self._pending_auto_ocr = None
         self._image_import_queue.clear()
+        self._auto_sort_queue.clear()
         if self._image_import_task is not None:
             self._image_import_task.cancel()
         for image_widget in self.findChildren(ImageItemWidget):

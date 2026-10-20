@@ -459,6 +459,19 @@ def run_acceptance(
             }
 
         run_step("ocr_fixture", ocr_regression)
+
+        def photo_classifier_regression():
+            # The model is git-ignored, so a source checkout may lack it; the
+            # packaged EXE must always carry a working one.
+            classifier = app_module.get_photo_classifier()
+            if classifier is None and not getattr(sys, "frozen", False):
+                return {"skipped": "源码目录没有 models/photo_classifier.onnx"}
+            require(classifier is not None, "自动分类模型没有打包进程序")
+            prediction = classifier.predict(str(ocr_fixture))
+            require(prediction.category in (4, 5), f"自动分类回归失败：关门样图被判为 {prediction.category}")
+            return {"category": prediction.category, "confidence": round(prediction.confidence, 4)}
+
+        run_step("photo_classifier", photo_classifier_regression)
         result["ok"] = True
     except Exception as exc:
         result["error"] = str(exc)
