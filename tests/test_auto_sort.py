@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -323,6 +324,57 @@ class AutoSortTests(unittest.TestCase):
         self.assertEqual(dialog.combo_other.count(), 8)
         dialog.candidate_buttons[2].click()
         self.assertEqual(dialog.chosen_category, 2)
+
+    def test_data_health_warns_about_misplaced_photos_and_opens_their_box(self):
+        with qt_temporary_directory() as root:
+            box_dir = root / BOX
+            box_dir.mkdir()
+            names = {category: f"{BOX}-{category}.jpg" for category in (1, 3, 4, 7)}
+            for category, name in names.items():
+                write_photo(box_dir, name, "#335577")
+            con.write_meta(root / con.META_NAME, {
+                BOX: {str(category): [name] for category, name in names.items()},
+            })
+            classifier = FakeClassifier({
+                names[1]: predicted(1, 0.99),
+                names[3]: predicted(OTHER, 0.99),
+                names[4]: predicted(4, 0.99),
+                names[7]: predicted(4, 0.98),
+            })
+            threads = []
+            original_predict = classifier.predict
+            classifier.predict = lambda sample: threads.append(threading.get_ident()) or original_predict(sample)
+            before = {path.name: path.stat().st_mtime_ns for path in box_dir.iterdir()}
+
+            with patch.object(con, "get_photo_classifier", return_value=classifier):
+                dialog = con.DataHealthDialog(root)
+                self.addCleanup(dialog.deleteLater)
+                dialog.show()
+                deadline = time.monotonic() + 5
+                while dialog.report is None and time.monotonic() < deadline:
+                    QApplication.processEvents()
+                    time.sleep(0.01)
+
+            self.assertIsNotNone(dialog.report)
+            self.assertEqual(dialog.report.error_count, 0)
+            self.assertNotIn(threading.get_ident(), threads)
+            rows = [dialog.results.topLevelItem(i) for i in range(dialog.results.topLevelItemCount())]
+            flagged = [row for row in rows if row.text(1) == "疑似放错类别"]
+            self.assertEqual(
+                [row.text(2) for row in flagged],
+                [
+                    f"{BOX} · {names[3]} 放在 3 类（全开门满箱），看起来像 6-8 类（加固/底梁/铅封）（模型把握 99%）",
+                    f"{BOX} · {names[7]} 放在 6-8 类（加固/底梁/铅封），看起来像 4 类（半关门满箱）（模型把握 98%）",
+                ],
+            )
+            self.assertEqual({row.text(0) for row in flagged}, {"警告"})
+            self.assertIn("模型已核对 4 张照片的类别", dialog.summary.text())
+            self.assertEqual({path.name: path.stat().st_mtime_ns for path in box_dir.iterdir()}, before)
+
+            dialog.results.itemDoubleClicked.emit(flagged[0], 2)
+
+            self.assertEqual(dialog.selected_task_name, BOX)
+            self.assertEqual(dialog.result(), con.QDialog.Accepted)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,11 @@ META_NAME = "meta.json"
 META_BAK_NAME = "meta.json.bak"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
 MAX_ISSUES = 500
+# The photo classifier knows slots 1-5; any other prediction (its OTHER class)
+# means "looks like slots 6-8".
+MODEL_SLOT_CATEGORIES = (1, 2, 3, 4, 5)
+SUSPECT_CATEGORY_THRESHOLD = 0.95
+OTHER_SLOTS_TEXT = "6-8 类（加固/底梁/铅封）"
 
 
 class HealthScanCancelled(Exception):
@@ -41,6 +46,7 @@ class HealthReport:
     used_backup: bool
     issues: tuple[HealthIssue, ...]
     truncated: bool = False
+    classified_photo_count: int = 0
 
     @property
     def error_count(self) -> int:
@@ -58,6 +64,8 @@ class HealthReport:
             f"任务：{self.task_count}，已引用照片：{self.referenced_photo_count}",
             f"错误：{self.error_count}，警告：{self.warning_count}",
         ]
+        if self.classified_photo_count:
+            lines.append(f"模型核对照片类别：{self.classified_photo_count} 张")
         if not self.issues:
             lines.append("未发现问题。")
         else:
@@ -81,6 +89,31 @@ def _read_json_dict(path: Path) -> tuple[dict | None, str]:
     return value, ""
 
 
+def _category_text(category: int, labels: Mapping[int, str] | None) -> str:
+    if category not in MODEL_SLOT_CATEGORIES:
+        return OTHER_SLOTS_TEXT
+    label = (labels or {}).get(category)
+    return f"{category} 类（{label}）" if label else f"{category} 类"
+
+
+def suspected_wrong_category(
+    placed: int,
+    prediction,
+    threshold: float = SUSPECT_CATEGORY_THRESHOLD,
+) -> int | None:
+    """The slot a confident prediction points to when it disagrees with `placed`.
+
+    Returns the predicted slot 1-5, 0 for "looks like 6-8", or None when the
+    photo is where it belongs or the model is not sure enough.
+    """
+    if prediction.confidence < threshold:
+        return None
+    predicted = prediction.category if prediction.category in MODEL_SLOT_CATEGORIES else 0
+    if placed in MODEL_SLOT_CATEGORIES:
+        return None if predicted == placed else predicted
+    return predicted or None
+
+
 def scan_data_health(
     root: Path | str,
     *,
@@ -88,12 +121,21 @@ def scan_data_health(
     category_count: int = 8,
     cancel_event=None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    photo_classifier=None,
+    category_threshold: float = SUSPECT_CATEGORY_THRESHOLD,
+    category_labels: Mapping[int, str] | None = None,
 ) -> HealthReport:
-    """Inspect one workspace without creating, changing, or deleting files."""
+    """Inspect one workspace without creating, changing, or deleting files.
+
+    With a `photo_classifier` (anything with `predict(path)` returning a
+    category and confidence), every referenced photo is also classified and a
+    confident disagreement with its slot becomes a warning.
+    """
     started = time.perf_counter()
     root_path = Path(root)
     issues: list[HealthIssue] = []
     truncated = False
+    classified_photo_count = 0
 
     def check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -232,6 +274,7 @@ def scan_data_health(
 
         referenced_names: set[str] = set()
         seen_references: dict[str, int] = {}
+        placed_photos: list[tuple[int, Path]] = []
         for category in range(1, category_count + 1):
             check_cancelled()
             key = str(category)
@@ -295,6 +338,31 @@ def scan_data_health(
                     continue
                 referenced_names.add(source.name.casefold())
                 referenced_photo_count += 1
+                placed_photos.append((category, source))
+
+        if photo_classifier is not None:
+            for category, source in placed_photos:
+                check_cancelled()
+                try:
+                    prediction = photo_classifier.predict(source)
+                except Exception:
+                    # Deleted since it was listed, or not a decodable image.
+                    continue
+                classified_photo_count += 1
+                looks_like = suspected_wrong_category(category, prediction, category_threshold)
+                if looks_like is None:
+                    continue
+                add_issue(
+                    "suspected_wrong_category",
+                    "warning",
+                    "疑似放错类别",
+                    (
+                        f"{source.name} 放在 {_category_text(category, category_labels)}，"
+                        f"看起来像 {_category_text(looks_like, category_labels)}"
+                        f"（模型把握 {prediction.confidence:.0%}）"
+                    ),
+                    box_name,
+                )
 
         try:
             disk_images = tuple(
@@ -332,6 +400,7 @@ def scan_data_health(
         used_backup,
         issues,
         truncated,
+        classified_photo_count,
     )
 
 
@@ -344,6 +413,7 @@ def _build_report(
     used_backup: bool,
     issues: list[HealthIssue],
     truncated: bool,
+    classified_photo_count: int = 0,
 ) -> HealthReport:
     return HealthReport(
         root=root,
@@ -355,4 +425,5 @@ def _build_report(
         used_backup=used_backup,
         issues=tuple(issues),
         truncated=truncated,
+        classified_photo_count=classified_photo_count,
     )

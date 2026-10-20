@@ -842,10 +842,11 @@ class HealthCheckSignals(QObject):
 
 
 class HealthCheckTask(QRunnable):
-    def __init__(self, root: Path, validator):
+    def __init__(self, root: Path, validator, photo_classifier=None):
         super().__init__()
         self.root = Path(root)
         self.validator = validator
+        self.photo_classifier = photo_classifier
         self.cancel_event = threading.Event()
         self.signals = HealthCheckSignals()
         self.setAutoDelete(True)
@@ -864,6 +865,8 @@ class HealthCheckTask(QRunnable):
                     total,
                     label,
                 ),
+                photo_classifier=self.photo_classifier,
+                category_labels={idx: name.split(" ", 1)[-1] for idx, name in ALL_CATEGORIES},
             )
             self.signals.finished.emit(report)
         except HealthScanCancelled:
@@ -5372,6 +5375,7 @@ class DataHealthDialog(QDialog):
         super().__init__(parent)
         self.root_dir = Path(root_dir)
         self.report: HealthReport | None = None
+        self.selected_task_name = ""
         self._error_details = ""
         self._task = None
         self.setWindowTitle("数据检查")
@@ -5414,6 +5418,7 @@ class DataHealthDialog(QDialog):
         self.results.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.results.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.results.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.results.itemDoubleClicked.connect(self.open_issue_task)
         layout.addWidget(self.results, 1)
 
         buttons = QHBoxLayout()
@@ -5448,7 +5453,7 @@ class DataHealthDialog(QDialog):
             declared = extract_declared_container_no(name)
             return bool(declared and validate_container_no(declared))
 
-        task = HealthCheckTask(self.root_dir, valid_task_name)
+        task = HealthCheckTask(self.root_dir, valid_task_name, get_photo_classifier())
         task.signals.progress.connect(self.on_progress)
         task.signals.finished.connect(self.on_finished)
         task.signals.cancelled.connect(self.on_cancelled)
@@ -5476,10 +5481,15 @@ class DataHealthDialog(QDialog):
         self.progress.hide()
         self.btn_cancel_health.setEnabled(False)
         self.results.clear()
+        classified = (
+            f"模型已核对 {report.classified_photo_count} 张照片的类别。"
+            if report.classified_photo_count else ""
+        )
         if report.issues:
             self.summary.setText(
                 f"检查完成：{report.task_count} 个任务，发现 "
                 f"{report.error_count} 个错误、{report.warning_count} 个警告。"
+                f"{classified}双击带箱号的问题可打开该任务。"
             )
             severity_labels = {"error": "错误", "warning": "警告", "info": "提示"}
             severity_colors = {
@@ -5496,13 +5506,14 @@ class DataHealthDialog(QDialog):
                 ])
                 item.setForeground(0, QBrush(severity_colors.get(issue.severity, QColor(Theme.TEXT_SEC))))
                 item.setToolTip(2, detail)
+                item.setData(0, Qt.UserRole, issue.task_name)
                 self.results.addTopLevelItem(item)
         else:
             checked_at = report.checked_at.replace("T", " ")
             self.summary.setText(
                 f"检查完成：{report.task_count} 个任务、"
                 f"{report.referenced_photo_count} 张已引用照片，未发现问题。"
-                f"检查时间 {checked_at}。"
+                f"{classified}检查时间 {checked_at}。"
             )
             item = QTreeWidgetItem(["正常", "未发现问题", f"检查耗时 {report.duration_ms} ms"])
             item.setForeground(0, QBrush(QColor(Theme.SUCCESS)))
@@ -5526,6 +5537,13 @@ class DataHealthDialog(QDialog):
         self.summary.setText("数据检查已取消，未修改任何照片或元数据。")
         self.results.clear()
         self.results.addTopLevelItem(QTreeWidgetItem(["提示", "检查已取消", "可以关闭窗口后重新开始"]))
+
+    def open_issue_task(self, item: QTreeWidgetItem, _column: int = 0):
+        task_name = item.data(0, Qt.UserRole)
+        if not task_name or not (self.root_dir / str(task_name)).is_dir():
+            return
+        self.selected_task_name = str(task_name)
+        self.accept()
 
     def copy_report(self):
         if self.report is None and not self._error_details:
@@ -7981,7 +7999,10 @@ class ContainerApp(QMainWindow):
         if not self.root or not self.root.is_dir():
             self.show_toast("工作目录不可用，请重新选择")
             return
-        DataHealthDialog(self.root, self).exec()
+        dialog = DataHealthDialog(self.root, self)
+        dialog.exec()
+        if dialog.selected_task_name:
+            self.open_box_name(dialog.selected_task_name)
 
     def open_theme_choices(self):
         previous = normalize_theme_name(self.conf.get("theme_name"))
