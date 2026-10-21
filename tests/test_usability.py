@@ -80,6 +80,34 @@ class UsabilityTests(unittest.TestCase):
         self.assertTrue(all(isinstance(row.slot_strip, con.SlotStrip) for row in rows))
         self.assertIsNone(con.TaskRowWidget({"name": "X", "pic_cnt": 0, "missing": []}).slot_strip)
 
+    def test_task_row_secondary_details_do_not_overlap_the_box_number(self):
+        window = self.window()
+        for width in (641, 455, 1366):
+            with self.subTest(width=width):
+                window.resize(width, 700)
+                settle(self.app, 0.05)
+                row = window.list.itemWidget(window.list.item(0))
+                visible = [
+                    widget for widget in (
+                        row.container_label, row.size_type_label, row.slot_strip,
+                        row.verification_badge, row.task_badge,
+                    ) if widget is not None and widget.isVisible()
+                ]
+                rectangles = [
+                    widget.rect().translated(widget.mapTo(row, widget.rect().topLeft()))
+                    for widget in visible
+                ]
+                self.assertTrue(row.container_label.isVisible())
+                self.assertTrue(row.task_badge.isVisible())
+                for left, right in zip(rectangles, rectangles[1:]):
+                    self.assertLess(left.right(), right.left())
+                self.assertLess(rectangles[-1].right(), row.width())
+                if width == 641:
+                    self.assertTrue(row.slot_strip.isHidden())
+                if width == 1366:
+                    self.assertFalse(row.slot_strip.isHidden())
+                    self.assertFalse(row.size_type_label.isHidden())
+
     # --- detail page navigation -------------------------------------------
     def test_next_and_previous_box_follow_the_task_list_order(self):
         window = self.window()
@@ -221,6 +249,74 @@ class UsabilityTests(unittest.TestCase):
         self.assertEqual([Path(path).name for path, _caption in photos], list(names.values()))
         self.assertEqual(index, 1)
         self.assertIn("4 半关门满箱", photos[1][1])
+
+    # --- report page --------------------------------------------------------
+    def test_report_missing_column_carries_slot_squares_and_full_text(self):
+        box_dir = self.root / BOXES[0]
+        write_photo(box_dir / f"{BOXES[0]}-1.jpg", "#336699")
+        con.write_meta(self.root / con.META_NAME, {
+            "__requirements__": [1, 2, 3],
+            BOXES[0]: {"1": [f"{BOXES[0]}-1.jpg"]},
+        })
+        window = self.window()
+        window.show_report()
+        settle(self.app)
+        page = window.report_page
+        rows = {page.details_table.item(r, 0).text(): r for r in range(page.details_table.rowCount())}
+        item = page.details_table.item(rows[BOXES[0]], 4)
+
+        counts, required, missing = item.data(con.SlotStripDelegate.SLOTS_ROLE)
+        self.assertEqual(counts[1], 1)
+        self.assertEqual(required, {1, 2, 3})
+        self.assertEqual(missing, 2)
+        self.assertEqual(item.text(), "全开门1/2箱、全开门满箱")
+        self.assertIn("全开门满箱", item.toolTip())
+        self.assertIsInstance(page.details_table.itemDelegateForColumn(4), con.SlotStripDelegate)
+
+    def test_category_table_is_exactly_tall_enough_for_eight_rows(self):
+        window = self.window()
+        window.show_report()
+        settle(self.app)
+        table = window.report_page.category_table
+
+        self.assertEqual(table.rowCount(), 8)
+        rows_height = sum(table.rowHeight(row) for row in range(8))
+        self.assertEqual(table.height(), table.horizontalHeader().height() + rows_height + 2 * table.frameWidth())
+        self.assertLess(table.height(), 274)
+
+    # --- small flows --------------------------------------------------------
+    def test_batch_create_lists_the_work_folder_once_while_typing(self):
+        dialog = con.BatchCreateDialog(self.root)
+        self.addCleanup(dialog.deleteLater)
+        listings = []
+        original = dialog._list_existing_names
+        dialog._list_existing_names = lambda: listings.append(1) or original()
+
+        for text in ("L", "LY", "LYGU", "LYGU3043781\nTGHU"):
+            dialog.txt.setPlainText(text)
+
+        self.assertLessEqual(len(listings), 1)
+        self.assertEqual(dialog.analysis.existing_count, 1)
+
+    def test_completed_box_offers_the_next_box_in_its_toast(self):
+        window = self.window()
+        names = window._navigation_names()
+        con.write_meta(self.root / con.META_NAME, {"__requirements__": [1]})
+        window.open_box_name(names[0])
+        detail = window._detail_page
+        toasts = []
+        detail._notify = lambda text, action="", callback=None: toasts.append((text, action, callback))
+        photo = Path(self.tmp.name) / "slot1.jpg"
+        write_photo(photo, "#123456")
+        detail.maybe_auto_ocr = lambda *_args, **_kwargs: None
+
+        detail.add_files(1, [str(photo)])
+
+        complete = [entry for entry in toasts if entry[1] == "下一箱"]
+        self.assertTrue(complete, toasts)
+        self.assertIn("必填照片已经补齐", complete[-1][0])
+        complete[-1][2]()
+        self.assertEqual(window._detail_page.box_name, names[1])
 
 
 if __name__ == "__main__":

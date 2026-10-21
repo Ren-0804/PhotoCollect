@@ -462,7 +462,7 @@ def _container_candidates(rows):
                     if skip and tier != 0:
                         # Without a confirming check digit, only accept the
                         # skip when it leaves a clean six-digit serial row.
-                        serial_token = line[stream[1][2]]
+                        serial_token = lines[stream[1][1]][stream[1][2]]
                         if len(_segment_chars(serial_token["text"])) != 6:
                             continue
                     used.add((line_index, token_index))

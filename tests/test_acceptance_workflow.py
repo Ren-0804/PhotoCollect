@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,8 +143,36 @@ class AcceptanceWorkflowTests(unittest.TestCase):
         )
         self.assertLess(position, script.index("[2/5]"))
         following = script[position + len(pytest_line):].split()
-        self.assertEqual(following[:4], ["if", "errorlevel", "1", "goto"])
+        self.assertEqual(following[:4], ["if", "not", '"!ERRORLEVEL!"=="0"', "goto"])
         self.assertEqual(following[4], ":fail_tests")
+
+    @unittest.skipUnless(os.name == "nt", "Windows CMD exit-code handling")
+    def test_release_gate_rejects_positive_and_negative_child_exit_codes(self):
+        script = (Path(__file__).resolve().parent.parent / "一键构建_PhotoCollect.bat").read_text(
+            encoding="utf-8"
+        )
+        lines = script.splitlines()
+        guard = next(
+            next(following.strip() for following in lines[index + 1:] if following.strip())
+            for index, line in enumerate(lines)
+            if " -m unittest discover " in line
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "exit-code-probe.bat"
+            for code in (0, 1, -1, -1073741819):
+                with self.subTest(code=code):
+                    probe.write_text(
+                        "@echo off\nsetlocal EnableDelayedExpansion\n"
+                        f"cmd.exe /d /c exit /b {code}\n{guard}\n"
+                        "echo accepted\nexit /b 0\n:fail_tests\necho rejected\nexit /b 1\n",
+                        encoding="ascii",
+                    )
+                    result = subprocess.run(
+                        ["cmd.exe", "/d", "/c", str(probe)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0 if code == 0 else 1)
+                    self.assertIn("accepted" if code == 0 else "rejected", result.stdout)
 
     def test_spec_excludes_foreign_icu_that_can_shadow_windows_qt_runtime(self):
         spec = (

@@ -143,7 +143,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
 APP_LOGO_PNG = "assets/app-logo.png"
 APP_LOGO_ICO = "assets/app-logo.ico"
 APP_DISPLAY_NAME = "集装箱照片收集工具"
-APP_VERSION = "5.16.21"
+APP_VERSION = "5.16.22"
 OCR_REGRESSION_CONTAINER_NO = "LYGU3043781"
 OCR_REGRESSION_SIZE_TYPE = "22G1"
 OCR_REGRESSION_FIXTURE = "tests/fixtures/container_sample.jpg"
@@ -2832,6 +2832,7 @@ class BatchCreateDialog(QDialog):
         self.created_count = 0
         self.failed_count = 0
         self.analysis = BatchAnalysis((), 0, 0, 0, 0)
+        self._existing_names = None
         self.setWindowTitle("批量新建箱号")
         self.setMinimumSize(560, 460)
         self.setup_ui()
@@ -2868,15 +2869,22 @@ class BatchCreateDialog(QDialog):
         self.btn_create.clicked.connect(self.run)
         layout.addWidget(self.btn_create)
 
-    def update_preview(self):
+    def _list_existing_names(self) -> set:
         try:
-            existing = {
-                path.name for path in self.root_dir.iterdir()
-                if path.is_dir() and not path.name.startswith(".")
-            }
+            with os.scandir(self.root_dir) as entries:
+                return {
+                    entry.name for entry in entries
+                    if entry.is_dir() and not entry.name.startswith(".")
+                }
         except OSError:
-            existing = set()
-        self.analysis = analyze_batch_input(self.txt.toPlainText(), existing)
+            return set()
+
+    def update_preview(self, refresh_existing: bool = False):
+        # Typing reuses one listing of the work folder (a network share makes
+        # a listing per keystroke noticeable); creating lists it again.
+        if refresh_existing or self._existing_names is None:
+            self._existing_names = self._list_existing_names()
+        self.analysis = analyze_batch_input(self.txt.toPlainText(), self._existing_names)
         total = len(self.analysis.creatable)
         self.btn_create.setEnabled(total > 0)
         self.btn_create.setText(f"创建 {total} 个任务" if total else "开始创建")
@@ -2904,7 +2912,7 @@ class BatchCreateDialog(QDialog):
     def run(self):
         self.created_count = 0
         self.failed_count = 0
-        self.update_preview()
+        self.update_preview(refresh_existing=True)
         if not self.analysis.creatable:
             self.preview.setText("没有可创建的箱号，请检查输入内容")
             self.preview.setStyleSheet(f"color:{Theme.ERROR}; background:{Theme.ERROR_SOFT}; border:1px solid {Theme.ERROR_LINE}; padding:10px; border-radius:8px;")
@@ -3560,19 +3568,29 @@ class SlotStrip(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.counts = {int(key): int(value) for key, value in (counts or {}).items()}
         self.required = {int(category) for category in (required or [])}
-        cells = len(ALL_CATEGORIES)
-        self.setFixedSize(cells * self.CELL + (cells - 2) * self.GAP + self.GROUP_GAP, self.CELL)
+        self.setFixedSize(self.strip_width(), self.CELL)
         have = [str(idx) for idx, _ in ALL_CATEGORIES if self.counts.get(idx)]
         need = [str(idx) for idx, _ in ALL_CATEGORIES if idx in self.required and not self.counts.get(idx)]
         self.setAccessibleName(f"已有 {','.join(have) or '无'}；缺 {','.join(need) or '无'}")
 
-    def cell_state(self, idx: int) -> str:
-        if self.counts.get(idx):
-            return "done"
-        return "missing" if idx in self.required else "optional"
+    @classmethod
+    def strip_width(cls) -> int:
+        cells = len(ALL_CATEGORIES)
+        return cells * cls.CELL + (cells - 2) * cls.GAP + cls.GROUP_GAP
 
-    def paintEvent(self, _event):
-        painter = QPainter(self)
+    def cell_state(self, idx: int) -> str:
+        return self.state_for(idx, self.counts, self.required)
+
+    @staticmethod
+    def state_for(idx: int, counts, required) -> str:
+        if counts.get(idx):
+            return "done"
+        return "missing" if idx in required else "optional"
+
+    @classmethod
+    def paint_cells(cls, painter: QPainter, x: int, y: int, counts, required) -> None:
+        """Draw the eight squares with their top-left corner at (x, y)."""
+        painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
         font = painter.font()
         font.setPixelSize(10)
@@ -3583,17 +3601,54 @@ class SlotStrip(QWidget):
             "missing": (Theme.WARNING_SOFT, Theme.WARNING, Theme.WARNING),
             "optional": (None, Theme.BORDER_HOVER, Theme.TEXT_MUTED),
         }
-        x = 0
         for idx, _name in ALL_CATEGORIES:
-            fill, border, text = styles[self.cell_state(idx)]
-            rect = QRect(x, 0, self.CELL - 1, self.CELL - 1)
+            fill, border, text = styles[cls.state_for(idx, counts, required)]
+            rect = QRect(x, y, cls.CELL - 1, cls.CELL - 1)
             painter.setPen(QPen(QColor(border), 1))
             painter.setBrush(QBrush(QColor(fill)) if fill else Qt.NoBrush)
             painter.drawRoundedRect(rect, 4, 4)
             painter.setPen(QColor(text))
             painter.drawText(rect, Qt.AlignCenter, str(idx))
-            x += self.CELL + (self.GROUP_GAP if idx == 5 else self.GAP)
+            x += cls.CELL + (cls.GROUP_GAP if idx == 5 else cls.GAP)
+        painter.restore()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        self.paint_cells(painter, 0, 0, self.counts, self.required)
         painter.end()
+
+
+class SlotStripDelegate(QStyledItemDelegate):
+    """Report table cell: the slot squares, then "缺 N 项" or "齐全". The
+    item's text keeps the full missing list for search, copy and tooltip."""
+
+    SLOTS_ROLE = int(Qt.UserRole) + 2
+
+    def paint(self, painter, option, index):
+        slots = index.data(self.SLOTS_ROLE)
+        if not slots:
+            super().paint(painter, option, index)
+            return
+        counts, required, missing = slots
+        painter.save()
+        background = index.data(Qt.BackgroundRole)
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+        elif background is not None:
+            painter.fillRect(option.rect, background)
+        x = option.rect.x() + 8
+        y = option.rect.y() + (option.rect.height() - SlotStrip.CELL) // 2
+        SlotStrip.paint_cells(painter, x, y, counts, required)
+        text_rect = option.rect.adjusted(SlotStrip.strip_width() + 18, 0, -6, 0)
+        painter.setPen(QColor(Theme.ERROR if missing else Theme.TEXT_MUTED))
+        painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, f"缺 {missing} 项" if missing else "齐全")
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        if index.data(self.SLOTS_ROLE):
+            size.setWidth(SlotStrip.strip_width() + 80)
+        return size
 
 
 class TaskRowWidget(QFrame):
@@ -3627,6 +3682,7 @@ class TaskRowWidget(QFrame):
         content_layout.setColumnMinimumWidth(0, 145)
         content_layout.setColumnMinimumWidth(1, 64)
         content_layout.setColumnStretch(2, 1)
+        self._content_layout = content_layout
 
         # Keep the original combined title value for callers that use
         # fullText(), while rendering the visible title in stable columns.
@@ -3703,11 +3759,13 @@ class TaskRowWidget(QFrame):
         content_layout.addWidget(self.detail_label, 1, 0, 1, 3)
         layout.addWidget(content, 1)
 
+        self._verification_spacer = None
         if self.verification_badge is not None:
             self.verification_badge.setFixedWidth(96)
             layout.addWidget(self.verification_badge, 0, Qt.AlignVCenter)
         else:
             layout.addSpacing(96)
+            self._verification_spacer = layout.itemAt(layout.count() - 1).spacerItem()
 
         task_state = data.get("task_state", "pending")
         if (
@@ -3735,6 +3793,40 @@ class TaskRowWidget(QFrame):
         arrow.setPixmap(app_icon(self, "expand", Theme.TEXT_MUTED).pixmap(16, 16))
         arrow.setAlignment(Qt.AlignCenter)
         layout.addWidget(arrow, 0, Qt.AlignVCenter)
+
+    def _apply_row_layout(self):
+        """Keep the box number and task state readable before secondary details."""
+        layout = self.layout()
+        self.size_type_label.setVisible(True)
+        self._content_layout.setColumnMinimumWidth(1, 64)
+        if self.slot_strip is not None:
+            self.slot_strip.setVisible(True)
+        if self.verification_badge is not None:
+            self.verification_badge.setVisible(True)
+        else:
+            self._verification_spacer.changeSize(96, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        layout.invalidate()
+
+        if self.slot_strip is not None and self.width() < layout.minimumSize().width():
+            self.slot_strip.hide()
+        if self.width() < layout.minimumSize().width():
+            if self.verification_badge is not None:
+                self.verification_badge.hide()
+            else:
+                self._verification_spacer.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+                layout.invalidate()
+        if self.width() < layout.minimumSize().width():
+            self.size_type_label.hide()
+            self._content_layout.setColumnMinimumWidth(1, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "task_badge"):
+            self._apply_row_layout()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_row_layout()
 
 
 class ActionToast(QFrame):
@@ -3979,6 +4071,8 @@ class BoxDetailWindow(QWidget):
         self._image_import_queue = []
         self._auto_sort_task = None
         self._auto_sort_queue = []
+        self._auto_sort_ready = None
+        self._auto_sort_applying = False
         self._pending_auto_sort_report = None
         self._page_disposed = False
 
@@ -4593,12 +4687,27 @@ class BoxDetailWindow(QWidget):
         self.btn_prev_box.setEnabled(position > 1)
         self.btn_next_box.setEnabled(0 < position < total)
 
+    def required_photos_complete(self) -> bool:
+        return all(self.meta.get(str(idx), []) for idx in self.get_effective_reqs())
+
+    def _completion_action(self):
+        """("下一箱", callback) for a toast once this box is complete, else no action."""
+        if not self.required_photos_complete() or not self.btn_next_box.isEnabled():
+            return "", None
+
+        def open_next():
+            if not self._page_disposed:
+                self.navigate_requested.emit(1)
+        return "下一箱", open_next
+
     def has_pending_saves(self) -> bool:
         return bool(
             self._image_import_task is not None
             or self._image_import_queue
             or self._auto_sort_task is not None
             or self._auto_sort_queue
+            or self._auto_sort_ready is not None
+            or self._auto_sort_applying
         )
 
     def update_box_title(self):
@@ -4656,7 +4765,7 @@ class BoxDetailWindow(QWidget):
             required = required[position:] + required[:position]
         missing = [idx for idx in required if not self.meta.get(str(idx), [])]
         if not missing:
-            self._notify("必填照片已经补齐")
+            self._notify("必填照片已经补齐", *self._completion_action())
             return
         idx = missing[0]
         self.select_category(idx)
@@ -4840,7 +4949,10 @@ class BoxDetailWindow(QWidget):
                 self.maybe_auto_ocr(idx, list(summary.added_names))
                 if len(summary.added_names) == 1:
                     self.focus_next_missing(idx)
-                self._notify(f"后台已保存 {len(summary.added_names)} 张照片")
+                saved = f"后台已保存 {len(summary.added_names)} 张照片"
+                if self.required_photos_complete():
+                    saved += "，必填照片已经补齐"
+                self._notify(saved, *self._completion_action())
             if (
                 not summary.added_names
                 and summary.duplicate_count == 1
@@ -4862,6 +4974,7 @@ class BoxDetailWindow(QWidget):
                 self._notify("后台保存已停止，已完成的照片仍安全保留")
         self._start_next_image_import()
         self._flush_auto_sort_report()
+        self._start_next_auto_sort()
 
     def _on_image_import_error(
         self,
@@ -4881,6 +4994,7 @@ class BoxDetailWindow(QWidget):
             )
         self._start_next_image_import()
         self._flush_auto_sort_report()
+        self._start_next_auto_sort()
 
     def add_files(self, idx, files):
         if self._use_background_image_import():
@@ -5075,7 +5189,24 @@ class BoxDetailWindow(QWidget):
         self._start_next_auto_sort()
 
     def _start_next_auto_sort(self):
-        if self._page_disposed or self._auto_sort_task is not None or not self._auto_sort_queue:
+        if self._page_disposed or self._auto_sort_task is not None or self._auto_sort_applying:
+            return
+        if self._image_import_task is not None or self._image_import_queue:
+            if self._auto_sort_ready is not None or self._auto_sort_queue:
+                self.auto_sort_zone.set_busy("等待照片保存后继续分类…")
+            return
+        if self._auto_sort_ready is not None:
+            classifier, items = self._auto_sort_ready
+            self._auto_sort_ready = None
+            self._auto_sort_applying = True
+            self.auto_sort_zone.set_busy("")
+            try:
+                self._apply_auto_sort(classifier, items)
+            finally:
+                self._auto_sort_applying = False
+            if self._page_disposed or self._image_import_task is not None or self._image_import_queue:
+                return
+        if not self._auto_sort_queue:
             return
         classifier = get_photo_classifier()
         sources = self._auto_sort_queue.pop(0)
@@ -5091,8 +5222,7 @@ class BoxDetailWindow(QWidget):
             self._auto_sort_task = None
         if self._page_disposed:
             return
-        self.auto_sort_zone.set_busy("")
-        self._apply_auto_sort(classifier, items)
+        self._auto_sort_ready = (classifier, items)
         self._start_next_auto_sort()
 
     def _on_auto_sort_error(self, task, message):
@@ -5304,6 +5434,8 @@ class BoxDetailWindow(QWidget):
         text = "；".join(parts)
         if trashed:
             self._notify(text + "；旧照片已移到最近删除", "撤销替换", lambda: self._undo_replace(trashed))
+        elif self.required_photos_complete():
+            self._notify(text + "；必填照片已经补齐", *self._completion_action())
         else:
             self._notify(text)
 
@@ -5377,6 +5509,7 @@ class BoxDetailWindow(QWidget):
         self._pending_auto_ocr = None
         self._image_import_queue.clear()
         self._auto_sort_queue.clear()
+        self._auto_sort_ready = None
         if self._image_import_task is not None:
             self._image_import_task.cancel()
         for image_widget in self.findChildren(ImageItemWidget):
@@ -6037,6 +6170,7 @@ class CollectionDashboardPage(QWidget):
     export_requested = Signal()
     refresh_requested = Signal()
     task_open_requested = Signal(str)
+    CATEGORY_ROW_HEIGHT = 26
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6187,6 +6321,8 @@ class CollectionDashboardPage(QWidget):
         for column in (0, 1, 2, 3, 5, 6):
             details_table_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         details_table_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self._slot_delegate = SlotStripDelegate(self.details_table)
+        self.details_table.setItemDelegateForColumn(4, self._slot_delegate)
         self.details_table.cellDoubleClicked.connect(self._open_row)
         layout.addWidget(self.details_table, 1)
 
@@ -6317,8 +6453,17 @@ class CollectionDashboardPage(QWidget):
                 f"QProgressBar::chunk {{ background:{chunk_color}; border-radius:3px; }}"
             )
             self.category_table.setCellWidget(row_index, 5, progress)
-            self.category_table.setRowHeight(row_index, 30)
+            self.category_table.setRowHeight(row_index, self.CATEGORY_ROW_HEIGHT)
+        self._fit_category_table()
         self._render_details()
+
+    def _fit_category_table(self) -> None:
+        """Exactly tall enough for the eight category rows, no clipped last row,
+        so the box table below gets the rest of the page."""
+        table = self.category_table
+        header_h = table.horizontalHeader().height() or table.horizontalHeader().sizeHint().height()
+        rows_h = sum(table.rowHeight(row) for row in range(table.rowCount())) or self.CATEGORY_ROW_HEIGHT * 8
+        table.setFixedHeight(header_h + rows_h + 2 * table.frameWidth())
 
     def _render_details(self, *_args) -> None:
         key = self.search.text().strip().lower()
@@ -6364,14 +6509,21 @@ class CollectionDashboardPage(QWidget):
                 if column == 2:
                     color = Theme.SUCCESS if report_row.photo_complete else Theme.ERROR
                     item.setForeground(QBrush(QColor(color)))
-                if column == 4 and report_row.missing_labels:
-                    item.setForeground(QBrush(QColor(Theme.ERROR)))
-                    item.setBackground(QBrush(QColor(Theme.ERROR_SOFT)))
+                if column == 4:
+                    if report_row.missing_labels:
+                        item.setForeground(QBrush(QColor(Theme.ERROR)))
+                        item.setBackground(QBrush(QColor(Theme.ERROR_SOFT)))
+                    item.setToolTip(f"缺失：{missing_text}" if report_row.missing_labels else "照片齐全")
+                    item.setData(SlotStripDelegate.SLOTS_ROLE, (
+                        {category: report_row.category_count(category) for category, _name in ALL_CATEGORIES},
+                        set(report_row.required_categories),
+                        len(report_row.missing_category_ids),
+                    ))
                 if column == 5 and report_row.verification_issue:
                     item.setForeground(QBrush(QColor(Theme.WARNING)))
                     item.setBackground(QBrush(QColor(Theme.WARNING_SOFT)))
                 self.details_table.setItem(row_index, column, item)
-            self.details_table.setRowHeight(row_index, 34)
+            self.details_table.setRowHeight(row_index, 30)
 
     def _open_row(self, row: int, _column: int) -> None:
         item = self.details_table.item(row, 0)

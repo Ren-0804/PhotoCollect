@@ -88,6 +88,19 @@ class PureOcrServiceTests(unittest.TestCase):
             self.assertTrue(parsed["inferred_check_digit"])
             self.assertEqual(verified["verification_status"], "inferred_match")
 
+    def test_wrapped_serial_with_another_token_on_its_line_is_read_safely(self):
+        raw = [
+            ([[400, 100], [480, 100], [480, 140], [400, 140]], "CICU", 0.99),
+            ([[0, 200], [80, 200], [80, 240], [0, 240]], "TARE", 0.99),
+            ([[400, 200], [540, 200], [540, 240], [400, 240]], "4102603", 0.99),
+        ]
+
+        parsed = parse_container_ocr(raw)
+
+        self.assertEqual(parsed["container_no"], "CICU4102603")
+        self.assertTrue(parsed["check_digit_valid"])
+        self.assertFalse(parsed["inferred_check_digit"])
+
 
     def test_spatially_separated_weight_boxes_still_parse(self):
         rows = [

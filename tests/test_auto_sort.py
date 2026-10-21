@@ -75,6 +75,15 @@ def file_drop(paths):
     return event, mime
 
 
+def wait_for(predicate, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    return bool(predicate())
+
+
 class AutoSortTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -315,6 +324,106 @@ class AutoSortTests(unittest.TestCase):
             # The slot summary comes after the background save's own toasts.
             self.assertIn("后台已保存 1 张照片", self.notices)
             self.assertIn("已自动放入 5 全关门 1 张", self.notices[-1])
+
+    def test_replacement_waits_for_active_and_queued_old_photos_and_supports_undo(self):
+        with qt_temporary_directory() as root:
+            old = write_photo(root, "old.jpg", "#101010")
+            queued = write_photo(root, "queued.jpg", "#606060")
+            new = write_photo(root, "new.jpg", "#EEEEEE")
+            detail = self.open_detail(root, FakeClassifier({"new.jpg": predicted(1, 0.99)}))
+            entered, release = threading.Event(), threading.Event()
+            original_import = con.import_task_images
+            questions, toasts = [], []
+            detail._ask_occupied_slot = lambda item, target, count: questions.append(count) or "replace"
+            detail._notify = lambda text, action="", callback=None: toasts.append((text, action, callback))
+
+            def delayed_import(*args, **kwargs):
+                if not entered.is_set():
+                    entered.set()
+                    if not release.wait(10):
+                        raise TimeoutError("test import gate")
+                return original_import(*args, **kwargs)
+
+            with patch.object(detail, "_use_background_image_import", return_value=True), patch.object(
+                con, "import_task_images", side_effect=delayed_import,
+            ):
+                try:
+                    detail.add_files(1, [str(old)])
+                    self.assertTrue(entered.wait(3))
+                    detail.add_files(1, [str(queued)])
+                    detail.auto_sort_files([str(new)])
+                    self.assertEqual(questions, [])
+                    self.assertTrue(detail.has_pending_saves())
+                    release.set()
+                    self.assertTrue(wait_for(lambda: not detail.has_pending_saves()))
+                finally:
+                    release.set()
+                    QThreadPool.globalInstance().waitForDone(5000)
+                    QApplication.processEvents()
+
+            names = self.stored(root)["1"]
+            self.assertEqual(questions, [2])
+            self.assertEqual([file_sha256(root / BOX / name) for name in names], [file_sha256(new)])
+            self.assertEqual(len(con.TrashStore(root).list_entries()), 2)
+            undo = next(callback for _text, action, callback in reversed(toasts) if action == "撤销替换")
+
+            undo()
+
+            self.assertEqual(
+                {file_sha256(root / BOX / name) for name in self.stored(root)["1"]},
+                {file_sha256(old), file_sha256(queued)},
+            )
+
+    def test_manual_save_started_during_classification_finishes_before_replacement(self):
+        with qt_temporary_directory() as root:
+            old = write_photo(root, "old.jpg", "#101010")
+            new = write_photo(root, "new.jpg", "#EEEEEE")
+            classifier = FakeClassifier({"new.jpg": predicted(1, 0.99)})
+            detail = self.open_detail(root, classifier)
+            classifying, release_prediction = threading.Event(), threading.Event()
+            saving, release_import = threading.Event(), threading.Event()
+            original_predict, original_import = classifier.predict, con.import_task_images
+            questions = []
+            detail._ask_occupied_slot = lambda item, target, count: questions.append(count) or "replace"
+
+            def delayed_predict(sample):
+                classifying.set()
+                if not release_prediction.wait(10):
+                    raise TimeoutError("test classifier gate")
+                return original_predict(sample)
+
+            def delayed_import(*args, **kwargs):
+                saving.set()
+                if not release_import.wait(10):
+                    raise TimeoutError("test import gate")
+                return original_import(*args, **kwargs)
+
+            with patch.object(detail, "_use_background_image_import", return_value=True), patch.object(
+                classifier, "predict", side_effect=delayed_predict,
+            ), patch.object(con, "import_task_images", side_effect=delayed_import):
+                try:
+                    detail.auto_sort_files([str(new)])
+                    self.assertTrue(classifying.wait(3))
+                    detail.add_files(1, [str(old)])
+                    self.assertTrue(saving.wait(3))
+                    release_prediction.set()
+                    self.assertTrue(wait_for(lambda: detail._auto_sort_ready is not None))
+                    self.assertEqual(questions, [])
+                    self.assertTrue(detail.has_pending_saves())
+                    release_import.set()
+                    self.assertTrue(wait_for(lambda: not detail.has_pending_saves()))
+                finally:
+                    release_prediction.set()
+                    release_import.set()
+                    QThreadPool.globalInstance().waitForDone(5000)
+                    QApplication.processEvents()
+
+            self.assertEqual(questions, [1])
+            self.assertEqual(
+                [file_sha256(root / BOX / name) for name in self.stored(root)["1"]],
+                [file_sha256(new)],
+            )
+            self.assertEqual(len(con.TrashStore(root).list_entries()), 1)
 
     def test_choice_dialog_offers_top_three_slots_and_any_slot(self):
         dialog = con.AutoSortChoiceDialog(QImage(), "x.jpg", predicted(OTHER, 0.5, runner_up=2))
